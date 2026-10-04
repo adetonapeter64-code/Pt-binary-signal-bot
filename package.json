@@ -1,16 +1,14 @@
 {
-  "name": "binary-signal-bot",
+  "name": "xauusd-pullback-bot",
   "version": "1.0.0",
-  "description": "5M binary options signal bot",
-  "main": "server.js",
+  "description": "XAUUSD H4 trend-pullback signals sent to Telegram",
+  "type": "module",
+  "main": "index.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node index.js"
   },
   "engines": {
     "node": ">=18"
   },
-  "dependencies": {
-    "express": "^4.21.2",
-    "node-telegram-bot-api": "^0.66.0"
-  }
+  "license": "MIT"
 }
