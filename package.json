@@ -1,0 +1,16 @@
+{
+  "name": "binary-signal-bot",
+  "version": "1.0.0",
+  "description": "5M binary options signal bot",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}
