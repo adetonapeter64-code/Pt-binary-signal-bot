@@ -1,1189 +1,1396 @@
-const express = require("express");
 const TelegramBot = require("node-telegram-bot-api");
+const express = require("express");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const OTCHARTS_API_KEY = process.env.OTCHARTS_API_KEY;
+const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY;
 
-if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN");
-if (!OTCHARTS_API_KEY) throw new Error("Missing OTCHARTS_API_KEY");
+const TIMEZONE = "Africa/Lagos";
 
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+// =====================================================
+// SETTINGS
+// =====================================================
 
-/* =========================================================
-   SETTINGS
-========================================================= */
+const ANALYSIS_TIMEFRAME = "1min";
 
-const VENUE = "otc";
-const TIMEFRAME_SECONDS = 60;
-const EXPIRY_SECONDS = 60;
+// 1-minute binary expiry
+const EXPIRY_MINUTES = 1;
 
+// Scan every 60 seconds
+const SCAN_INTERVAL = 60 * 1000;
+
+// Check finished signals every 10 seconds
+const RESULT_CHECK_INTERVAL = 10 * 1000;
+
+// Minimum strategy score
 const MIN_CONFIDENCE = 76;
 
-// Display only — this is NOT a guaranteed win probability.
+// Requested risk display
 const RISK_PERCENT = 5;
 
-// Maximum number of OTC currency pairs.
-// 0 = use every available OTC currency pair.
-const MAX_CURRENCY_PAIRS = 100;
+/*
+ * IMPORTANT - API RATE LIMITS:
+ *
+ * The previous version fetched candles separately for
+ * every PAIR, for every USER, on every scan. With 10
+ * pairs and even a handful of users that is hundreds of
+ * API calls per minute - far beyond Twelve Data's free
+ * tier (both the daily credit cap AND the per-minute
+ * request cap).
+ *
+ * Fix: there is now ONE shared scan per cycle. All pairs
+ * are fetched once, sequentially, with a small delay
+ * between each call, and the results (candleCache +
+ * signalPool) are shared by every user. Manual /signal
+ * requests reuse the same cached pool instead of
+ * triggering their own fetch, unless the cache is stale.
+ *
+ * NOTE: Twelve Data's free plan is commonly rate-limited
+ * per MINUTE (commonly ~8 requests/min), not just per day.
+ * Scanning 10 pairs every 60 seconds is still tight even
+ * with this fix. Check your actual plan's per-minute limit
+ * on the Twelve Data dashboard and adjust FETCH_DELAY_MS
+ * or trim PAIRS if you see 429 / "too many requests" in
+ * the logs.
+ */
+const FETCH_DELAY_MS = 6500;
 
-const SCAN_RETRY_MS = 15000;
-const RESULT_CHECK_MS = 5000;
-const SYMBOL_REFRESH_MS = 10 * 60 * 1000;
+// =====================================================
+// PAIRS
+// =====================================================
 
-const ACTIVE_START_HOUR = 21; // 9 PM WAT
-const ACTIVE_END_HOUR = 20;   // 8 PM WAT
+const PAIRS = [
+  "EUR/USD",
+  "GBP/USD",
+  "USD/JPY",
+  "AUD/USD",
+  "USD/CAD",
+  "EUR/GBP",
+  "NZD/USD",
+  "USD/CHF",
+  "EUR/JPY",
+  "GBP/JPY"
+];
 
-/* =========================================================
-   DATA
-========================================================= */
+// =====================================================
+// CHECK ENVIRONMENT
+// =====================================================
 
+if (!BOT_TOKEN) {
+  console.error("❌ BOT_TOKEN is missing");
+  process.exit(1);
+}
+
+if (!TWELVE_DATA_API_KEY) {
+  console.error("❌ TWELVE_DATA_API_KEY is missing");
+  process.exit(1);
+}
+
+// =====================================================
+// TELEGRAM BOT
+// =====================================================
+
+const bot = new TelegramBot(BOT_TOKEN, {
+  polling: true
+});
+
+// Anyone who sends /start is registered
 const users = new Set();
 
+// Active signals
 const activeSignals = new Map();
 
-const stats = new Map();
-
-const candles = new Map();
-
+// Prevent sending the same setup repeatedly
 const lastSignalCandle = new Map();
 
-let otcSymbols = [];
+// =====================================================
+// SHARED CANDLE CACHE + SIGNAL POOL
+// =====================================================
 
-let lastSymbolRefresh = 0;
+// symbol -> { candles, lastUpdated }
+const candleCache = new Map();
 
-let streamAbortController = null;
+// Shared result of the latest full scan, strongest first.
+let signalPool = [];
+let signalPoolUpdatedAt = 0;
 
-const scanningUsers = new Set();
+let apiQuotaBlockedUntil = 0;
+let apiQuotaMessage = "";
+let lastApiQuotaLog = 0;
 
-/* =========================================================
-   TIME
-========================================================= */
+let refreshing = false;
+let checkingResults = false;
 
-function lagosHour() {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "Africa/Lagos",
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// =====================================================
+// DAILY STATISTICS
+// =====================================================
+
+const dailyStats = {
+  trades: 0,
+  wins: 0,
+  losses: 0,
+  profit: 0,
+  loss: 0,
+  pairs: {}
+};
+
+let lastReportDate = null;
+
+// =====================================================
+// WEB SERVER
+// =====================================================
+
+app.get("/", (req, res) => {
+  res.send("🚨 Binary Signal Pro is running");
+});
+
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    bot: "Binary Signal Pro",
+    timezone: TIMEZONE,
+    analysis: ANALYSIS_TIMEFRAME,
+    expiry: `${EXPIRY_MINUTES}M`,
+    users: users.size,
+    activeSignals: activeSignals.size,
+    signalPoolSize: signalPool.length,
+    signalPoolAgeMs: signalPoolUpdatedAt
+      ? Date.now() - signalPoolUpdatedAt
+      : null,
+    apiQuotaBlocked: Date.now() < apiQuotaBlockedUntil,
+    apiQuotaBlockedUntil: apiQuotaBlockedUntil
+      ? new Date(apiQuotaBlockedUntil).toISOString()
+      : null,
+    apiQuotaMessage: apiQuotaMessage || null
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
+
+// =====================================================
+// NIGERIA TIME
+// =====================================================
+
+function nigeriaTimeParts() {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: TIMEZONE,
     hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
     hour12: false
   }).formatToParts(new Date());
 
-  return Number(parts.find(x => x.type === "hour").value);
+  const result = {};
+
+  for (const p of parts) {
+    if (p.type !== "literal") {
+      result[p.type] = p.value;
+    }
+  }
+
+  return {
+    hour: Number(result.hour),
+    minute: Number(result.minute),
+    second: Number(result.second)
+  };
 }
 
-function isTradingSession() {
-  const h = lagosHour();
-
-  // Active from 9 PM through 7:59 PM.
-  // Break from 8 PM to 8:59 PM.
-  return h >= ACTIVE_START_HOUR || h < ACTIVE_END_HOUR;
+function nigeriaDate() {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(new Date());
 }
 
-function formatTime(ts = Date.now()) {
+function formatNigeriaTime() {
   return new Intl.DateTimeFormat("en-US", {
-    timeZone: "Africa/Lagos",
+    timeZone: TIMEZONE,
     hour: "numeric",
     minute: "2-digit",
     second: "2-digit",
     hour12: true
-  }).format(new Date(ts));
+  }).format(new Date());
 }
 
-/* =========================================================
-   HTTP
-========================================================= */
+// =====================================================
+// TRADING SESSION
+// =====================================================
+//
+// ACTIVE:
+// 9:00 PM → 8:00 PM
+//
+// BREAK:
+// 8:00 PM → 9:00 PM
+// =====================================================
 
-async function apiGet(path) {
-  const response = await fetch(`https://otcharts.com${path}`, {
-    headers: {
-      Authorization: `Bearer ${OTCHARTS_API_KEY}`,
-      Accept: "application/json"
-    }
-  });
+function currentSessionState() {
+  const t = nigeriaTimeParts();
 
-  const text = await response.text();
+  const minutes = t.hour * 60 + t.minute;
 
-  if (!response.ok) {
-    throw new Error(`OTCharts ${response.status}: ${text}`);
+  if (minutes >= 21 * 60 || minutes < 20 * 60) {
+    return "ACTIVE";
   }
 
-  return JSON.parse(text);
+  return "BREAK";
 }
 
-/* =========================================================
-   POCKET OPTION OTC CURRENCY LIST
-========================================================= */
+// =====================================================
+// RESET DAILY STATS
+// =====================================================
 
-function isCurrencyPair(item) {
-  const name = String(item.name || "").trim();
+function resetDailyStats() {
+  dailyStats.trades = 0;
+  dailyStats.wins = 0;
+  dailyStats.losses = 0;
+  dailyStats.profit = 0;
+  dailyStats.loss = 0;
+  dailyStats.pairs = {};
 
-  // Examples:
-  // EUR/USD OTC
-  // GBP/JPY OTC
-  // NGN/USD OTC
-
-  return /^[A-Z]{3}\/[A-Z]{3} OTC$/i.test(name);
+  lastSignalCandle.clear();
 }
 
-async function refreshSymbols(force = false) {
-  if (
-    !force &&
-    otcSymbols.length > 0 &&
-    Date.now() - lastSymbolRefresh < SYMBOL_REFRESH_MS
-  ) {
-    return otcSymbols;
-  }
+// =====================================================
+// /START
+// =====================================================
+//
+// NO MENU BUTTONS
+// PUBLIC BOT
+// =====================================================
 
-  console.log("🔄 Refreshing Pocket Option OTC currency list...");
+bot.onText(/^\/start$/, async (msg) => {
+  const chatId = msg.chat.id;
 
-  const data = await apiGet("/v1/symbols?venue=otc");
+  users.add(chatId);
 
-  let pairs = (data.symbols || [])
-    .filter(isCurrencyPair)
-    .filter(x => x.isOtc !== false);
+  console.log(`👤 User registered: ${chatId}`);
 
-  // Prefer higher payout instruments when the API supplies payout.
-  pairs.sort((a, b) => {
-    const pa = Number.isFinite(Number(a.payout)) ? Number(a.payout) : -1;
-    const pb = Number.isFinite(Number(b.payout)) ? Number(b.payout) : -1;
+  const session = currentSessionState();
 
-    return pb - pa;
-  });
+  let message = `
+🚨 BINARY SIGNAL PRO 🚨
 
-  if (MAX_CURRENCY_PAIRS > 0) {
-    pairs = pairs.slice(0, MAX_CURRENCY_PAIRS);
-  }
+Welcome to the signal engine.
 
-  otcSymbols = pairs;
-  lastSymbolRefresh = Date.now();
+🧠 SMC ANALYSIS
+📊 1M TIMEFRAME
+⌛ 1M EXPIRY
+🔄 CONTINUOUS SCANNING
 
-  console.log(
-    `💱 Pocket Option OTC currency pairs loaded: ${otcSymbols.length}`
-  );
+The engine checks:
 
-  return otcSymbols;
-}
+📈 Trend
+💎 Fair Value Gap
+📦 Order Block
+💧 Liquidity
+🕯 Confirmation
 
-/* =========================================================
-   CANDLE STORAGE
-========================================================= */
+Only sufficiently strong setups can become signals.
 
-function getPairCandles(symbol) {
-  if (!candles.has(symbol)) {
-    candles.set(symbol, []);
-  }
+🏆 WIN / ❌ LOSS
 
-  return candles.get(symbol);
-}
+After every completed trade,
+the engine scans again.
+`;
 
-function addTick(symbol, price, timestamp) {
-  if (!Number.isFinite(price)) return;
+  if (session === "ACTIVE") {
+    message += `
+🟢 STATUS: ACTIVE
 
-  const bucket = Math.floor(timestamp / 60) * 60;
-
-  const list = getPairCandles(symbol);
-
-  let last = list[list.length - 1];
-
-  if (!last || last.time !== bucket) {
-    last = {
-      time: bucket,
-      open: price,
-      high: price,
-      low: price,
-      close: price
-    };
-
-    list.push(last);
-
-    while (list.length > 250) {
-      list.shift();
-    }
+🔎 The engine is scanning for the strongest confirmed setup.
+`;
   } else {
-    last.high = Math.max(last.high, price);
-    last.low = Math.min(last.low, price);
-    last.close = price;
-  }
-}
+    message += `
+💤 STATUS: BREAK
 
-/* =========================================================
-   INITIAL HISTORY
-========================================================= */
-
-async function loadInitialCandles(symbol) {
-  try {
-    const data = await apiGet(
-      `/v1/candles?venue=${VENUE}&symbol=${encodeURIComponent(
-        symbol
-      )}&tf=${TIMEFRAME_SECONDS}&limit=120`
-    );
-
-    if (!Array.isArray(data.candles)) return;
-
-    const cleaned = data.candles
-      .map(c => ({
-        time: Number(c.time),
-        open: Number(c.open),
-        high: Number(c.high),
-        low: Number(c.low),
-        close: Number(c.close)
-      }))
-      .filter(
-        c =>
-          Number.isFinite(c.time) &&
-          Number.isFinite(c.open) &&
-          Number.isFinite(c.high) &&
-          Number.isFinite(c.low) &&
-          Number.isFinite(c.close)
-      )
-      .sort((a, b) => a.time - b.time);
-
-    candles.set(symbol, cleaned.slice(-200));
-  } catch (err) {
-    console.log(`⚠️ History failed ${symbol}: ${err.message}`);
-  }
-}
-
-async function loadHistoryForPairs() {
-  const pairs = await refreshSymbols();
-
-  console.log(`📚 Loading history for ${pairs.length} OTC pairs...`);
-
-  // Sequential requests to avoid hammering the API.
-  for (const pair of pairs) {
-    await loadInitialCandles(pair.symbol);
-
-    await new Promise(resolve => setTimeout(resolve, 150));
+⏰ Next session starts at 9:00 PM Nigeria time.
+`;
   }
 
-  console.log("✅ Initial OTC history loaded");
-}
+  await bot.sendMessage(chatId, message);
+});
 
-/* =========================================================
-   INDICATORS
-========================================================= */
+// =====================================================
+// MANUAL /SIGNAL
+// =====================================================
 
-function ema(values, period) {
-  if (values.length < period) return null;
+bot.onText(/^\/signal$/, async (msg) => {
+  const chatId = msg.chat.id;
 
-  const multiplier = 2 / (period + 1);
+  users.add(chatId);
 
-  let result = values
-    .slice(0, period)
-    .reduce((a, b) => a + b, 0) / period;
+  await sendBestSignal(chatId);
+});
 
-  for (let i = period; i < values.length; i++) {
-    result =
-      (values[i] - result) * multiplier + result;
-  }
+// =====================================================
+// /MARKET
+// =====================================================
 
-  return result;
-}
+bot.onText(/^\/market$/, async (msg) => {
+  const chatId = msg.chat.id;
 
-function averageRange(list, period = 14) {
-  if (list.length < period + 1) return null;
+  users.add(chatId);
 
-  const ranges = list
-    .slice(-period)
-    .map(c => c.high - c.low);
+  const session = currentSessionState();
 
-  return ranges.reduce((a, b) => a + b, 0) / ranges.length;
-}
+  const apiStatus =
+    Date.now() < apiQuotaBlockedUntil
+      ? `⏸️ Paused until ${new Date(
+          apiQuotaBlockedUntil
+        ).toLocaleTimeString("en-US", { timeZone: TIMEZONE })}`
+      : "✅ Active";
 
-/* =========================================================
-   SMC ANALYSIS
-========================================================= */
-
-function analyzePair(pair) {
-  const symbol = pair.symbol;
-
-  const list = getPairCandles(symbol);
-
-  if (list.length < 40) return null;
-
-  // Ignore the currently forming candle.
-  const completed = list.slice(0, -1);
-
-  if (completed.length < 35) return null;
-
-  const a = completed[completed.length - 1];
-  const b = completed[completed.length - 2];
-  const c = completed[completed.length - 3];
-  const d = completed[completed.length - 4];
-
-  const closes = completed.map(x => x.close);
-
-  const fastEMA = ema(closes, 9);
-  const slowEMA = ema(closes, 21);
-
-  if (fastEMA === null || slowEMA === null) {
-    return null;
-  }
-
-  const range = averageRange(completed, 14);
-
-  if (!range || range <= 0) return null;
-
-  let buyScore = 0;
-  let sellScore = 0;
-
-  const buyReasons = [];
-  const sellReasons = [];
-
-  /* TREND */
-
-  if (fastEMA > slowEMA) {
-    buyScore += 18;
-    buyReasons.push("Bullish trend");
-  }
-
-  if (fastEMA < slowEMA) {
-    sellScore += 18;
-    sellReasons.push("Bearish trend");
-  }
-
-  /* MOMENTUM */
-
-  if (a.close > b.high) {
-    buyScore += 18;
-    buyReasons.push("Bullish BOS");
-  }
-
-  if (a.close < b.low) {
-    sellScore += 18;
-    sellReasons.push("Bearish BOS");
-  }
-
-  /* FVG */
-
-  // Bullish FVG:
-  // current low > candle two bars back high
-
-  if (a.low > c.high) {
-    buyScore += 15;
-    buyReasons.push("Bullish FVG");
-  }
-
-  // Bearish FVG:
-  // current high < candle two bars back low
-
-  if (a.high < c.low) {
-    sellScore += 15;
-    sellReasons.push("Bearish FVG");
-  }
-
-  /* ORDER BLOCK */
-
-  const bullishOB =
-    c.close < c.open &&
-    a.close > c.high;
-
-  const bearishOB =
-    c.close > c.open &&
-    a.close < c.low;
-
-  if (bullishOB) {
-    buyScore += 15;
-    buyReasons.push("Bullish OB");
-  }
-
-  if (bearishOB) {
-    sellScore += 15;
-    sellReasons.push("Bearish OB");
-  }
-
-  /* LIQUIDITY */
-
-  const recent = completed.slice(-10);
-
-  const recentHigh = Math.max(...recent.map(x => x.high));
-  const recentLow = Math.min(...recent.map(x => x.low));
-
-  if (a.high >= recentHigh && a.close < a.high) {
-    sellScore += 8;
-    sellReasons.push("Buy-side liquidity sweep");
-  }
-
-  if (a.low <= recentLow && a.close > a.low) {
-    buyScore += 8;
-    buyReasons.push("Sell-side liquidity sweep");
-  }
-
-  /* CONFIRMATION */
-
-  const bullishCandle =
-    a.close > a.open &&
-    a.close > b.close;
-
-  const bearishCandle =
-    a.close < a.open &&
-    a.close < b.close;
-
-  if (bullishCandle) {
-    buyScore += 15;
-    buyReasons.push("Bullish confirmation");
-  }
-
-  if (bearishCandle) {
-    sellScore += 15;
-    sellReasons.push("Bearish confirmation");
-  }
-
-  /* VOLATILITY FILTER */
-
-  const candleBody = Math.abs(a.close - a.open);
-
-  if (candleBody >= range * 0.45) {
-    if (a.close > a.open) {
-      buyScore += 6;
-      buyReasons.push("Strong body");
-    } else {
-      sellScore += 6;
-      sellReasons.push("Strong body");
-    }
-  }
-
-  const direction =
-    buyScore > sellScore ? "BUY" :
-    sellScore > buyScore ? "SELL" :
-    null;
-
-  if (!direction) return null;
-
-  const confidence =
-    direction === "BUY" ? buyScore : sellScore;
-
-  if (confidence < MIN_CONFIDENCE) {
-    return null;
-  }
-
-  const signalCandleTime = a.time;
-
-  const previousSignalCandle = lastSignalCandle.get(symbol);
-
-  if (previousSignalCandle === signalCandleTime) {
-    return null;
-  }
-
-  return {
-    symbol,
-    name: pair.name,
-    payout: pair.payout,
-    direction,
-    confidence,
-    entry: a.close,
-    candleTime: signalCandleTime,
-    reasons:
-      direction === "BUY"
-        ? buyReasons
-        : sellReasons
-  };
-}
-
-/* =========================================================
-   FIND BEST SIGNAL
-========================================================= */
-
-function findBestSignal() {
-  const candidates = [];
-
-  for (const pair of otcSymbols) {
-    const signal = analyzePair(pair);
-
-    if (signal) {
-      candidates.push(signal);
-    }
-  }
-
-  if (!candidates.length) {
-    return null;
-  }
-
-  candidates.sort((a, b) => {
-    // Highest strategy score first.
-    if (b.confidence !== a.confidence) {
-      return b.confidence - a.confidence;
-    }
-
-    // Prefer better payout if score is equal.
-    return Number(b.payout || 0) - Number(a.payout || 0);
-  });
-
-  return candidates[0];
-}
-
-/* =========================================================
-   SIGNAL MESSAGE
-========================================================= */
-
-function cleanPairName(name, symbol) {
-  if (name) {
-    return name.replace(/\s+OTC$/i, "");
-  }
-
-  return symbol.replace(/_otc$/i, "");
-}
-
-function buildSignalMessage(signal) {
-  const pairName = cleanPairName(
-    signal.name,
-    signal.symbol
-  );
-
-  const emoji =
-    signal.direction === "BUY"
-      ? "🟢 BUY"
-      : "🔴 SELL";
-
-  const payout =
-    signal.payout != null
-      ? `${signal.payout}%`
-      : "N/A";
-
-  return `
-🚨 BINARY SIGNAL 🚨
-
-⏱ Trade Time: ${formatTime()}
-
-💱 ${pairName} OTC → ${emoji}
-
-⌛ Expiry: 1M
-
-📊 Confidence: ${signal.confidence}%
-
-💰 Current Payout: ${payout}
-
-📈 SIGNAL RULES
-
-🧠 SMC + FVG + ORDER BLOCK
-💧 Liquidity + Confirmation
-💵 Risk: ${RISK_PERCENT}% of Capital
-
-⚠️ Confidence is a strategy score,
-not a guaranteed win probability.
-
-🔒 ONE TRADE AT A TIME
-`.trim();
-}
-
-/* =========================================================
-   SEND SIGNAL
-========================================================= */
-
-async function scanAndSendNext(chatId) {
-  if (!isTradingSession()) return;
-
-  if (activeSignals.has(chatId)) {
-    return;
-  }
-
-  if (scanningUsers.has(chatId)) {
-    return;
-  }
-
-  scanningUsers.add(chatId);
-
-  try {
-    await refreshSymbols();
-
-    const signal = findBestSignal();
-
-    if (!signal) {
-      console.log(`🔎 No valid setup for ${chatId}`);
-      return;
-    }
-
-    lastSignalCandle.set(
-      signal.symbol,
-      signal.candleTime
-    );
-
-    const signalId =
-      `${chatId}_${signal.symbol}_${Date.now()}`;
-
-    const expiryAt =
-      Date.now() + EXPIRY_SECONDS * 1000;
-
-    activeSignals.set(chatId, {
-      id: signalId,
-      chatId,
-      signal,
-      entry: signal.entry,
-      createdAt: Date.now(),
-      expiryAt
-    });
-
-    await bot.sendMessage(
-      chatId,
-      buildSignalMessage(signal)
-    );
-
-    console.log(
-      `📤 ${chatId}: ${signal.direction} ${signal.symbol}`
-    );
-
-  } catch (err) {
-    console.log(
-      `❌ Scan error ${chatId}: ${err.message}`
-    );
-  } finally {
-    scanningUsers.delete(chatId);
-  }
-}
-
-/* =========================================================
-   RESULT CHECK
-========================================================= */
-
-function recordResult(chatId, signal, result) {
-  if (!stats.has(chatId)) {
-    stats.set(chatId, {
-      trades: 0,
-      wins: 0,
-      losses: 0,
-      pairs: {}
-    });
-  }
-
-  const s = stats.get(chatId);
-
-  s.trades++;
-
-  if (result === "WIN") {
-    s.wins++;
-  } else {
-    s.losses++;
-  }
-
-  if (!s.pairs[signal.symbol]) {
-    s.pairs[signal.symbol] = {
-      trades: 0,
-      wins: 0,
-      losses: 0
-    };
-  }
-
-  const p = s.pairs[signal.symbol];
-
-  p.trades++;
-
-  if (result === "WIN") {
-    p.wins++;
-  } else {
-    p.losses++;
-  }
-}
-
-async function checkResults() {
-  if (!activeSignals.size) return;
-
-  for (const [chatId, active] of activeSignals.entries()) {
-    if (Date.now() < active.expiryAt) {
-      continue;
-    }
-
-    const signal = active.signal;
-
-    try {
-      const data = await apiGet(
-        `/v1/candles?venue=${VENUE}&symbol=${encodeURIComponent(
-          signal.symbol
-        )}&tf=${TIMEFRAME_SECONDS}&limit=5`
-      );
-
-      const list = data.candles || [];
-
-      const expiryCandle = list
-        .map(c => ({
-          time: Number(c.time),
-          close: Number(c.close)
-        }))
-        .filter(
-          c =>
-            Number.isFinite(c.time) &&
-            Number.isFinite(c.close)
-        )
-        .sort((a, b) => a.time - b.time)
-        .find(c => c.time >= signal.candleTime + 60);
-
-      if (!expiryCandle) {
-        continue;
-      }
-
-      const result =
-        signal.direction === "BUY"
-          ? expiryCandle.close > signal.entry
-            ? "WIN"
-            : "LOSS"
-          : expiryCandle.close < signal.entry
-            ? "WIN"
-            : "LOSS";
-
-      recordResult(chatId, signal, result);
-
-      const resultEmoji =
-        result === "WIN" ? "🏆 WIN" : "🔴 LOSS";
-
-      await bot.sendMessage(
-        chatId,
-        `
-🏁 TRADE RESULT
-
-💱 ${cleanPairName(signal.name, signal.symbol)}
-
-${signal.direction === "BUY" ? "🟢 BUY" : "🔴 SELL"}
-
-💵 Entry: ${signal.entry}
-📍 Expiry: ${expiryCandle.close}
-
-${resultEmoji}
-
-⏱ Expiry: 1M
-
-🔄 Scanning all OTC currency pairs again...
-`.trim()
-      );
-
-      activeSignals.delete(chatId);
-
-      // IMPORTANT:
-      // Immediately search for the next trade.
-      setTimeout(() => {
-        scanAndSendNext(chatId);
-      }, 500);
-
-    } catch (err) {
-      console.log(
-        `⚠️ Result check failed ${signal.symbol}: ${err.message}`
-      );
-    }
-  }
-}
-
-/* =========================================================
-   LIVE OTC STREAM
-========================================================= */
-
-async function startOTCStream() {
-  await refreshSymbols(true);
-
-  if (!otcSymbols.length) {
-    throw new Error(
-      "No Pocket Option OTC currency pairs available."
-    );
-  }
-
-  const symbols = otcSymbols.map(x => x.symbol);
-
-  const url =
-    `https://otcharts.com/v1/stream` +
-    `?venue=${VENUE}` +
-    `&symbol=${symbols.map(encodeURIComponent).join(",")}`;
-
-  console.log(
-    `📡 Opening OTC stream for ${symbols.length} currency pairs...`
-  );
-
-  streamAbortController =
-    new AbortController();
-
-  const response = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${OTCHARTS_API_KEY}`,
-      Accept: "text/event-stream"
-    },
-    signal: streamAbortController.signal
-  });
-
-  if (!response.ok) {
-    throw new Error(
-      `Stream failed: HTTP ${response.status}`
-    );
-  }
-
-  if (!response.body) {
-    throw new Error("OTC stream has no response body");
-  }
-
-  const reader = response.body.getReader();
-
-  const decoder = new TextDecoder();
-
-  let buffer = "";
-
-  while (true) {
-    const { value, done } = await reader.read();
-
-    if (done) {
-      throw new Error("OTC stream closed");
-    }
-
-    buffer += decoder.decode(value, {
-      stream: true
-    });
-
-    const events = buffer.split("\n\n");
-
-    buffer = events.pop() || "";
-
-    for (const event of events) {
-      const lines = event.split("\n");
-
-      let eventName = "message";
-      let dataText = "";
-
-      for (const line of lines) {
-        if (line.startsWith("event:")) {
-          eventName = line
-            .slice(6)
-            .trim();
-        }
-
-        if (line.startsWith("data:")) {
-          dataText += line
-            .slice(5)
-            .trim();
-        }
-      }
-
-      if (!dataText) continue;
-
-      try {
-        const data = JSON.parse(dataText);
-
-        if (eventName === "connected") {
-          console.log(
-            `✅ OTC stream connected: ${data.symbols?.length || 0} instruments`
-          );
-        }
-
-        if (eventName === "dropped") {
-          console.log(
-            `⚠️ OTC dropped:`,
-            data.dropped
-          );
-        }
-
-        if (eventName === "tick") {
-          const symbol = data.symbol;
-          const price = Number(data.price);
-          const time = Number(data.time);
-
-          if (
-            symbol &&
-            Number.isFinite(price) &&
-            Number.isFinite(time)
-          ) {
-            addTick(symbol, price, time);
-          }
-        }
-      } catch {
-        // Ignore malformed SSE events.
-      }
-    }
-  }
-}
-
-/* =========================================================
-   AUTOMATIC SCANNER
-========================================================= */
-
-async function automaticScanner() {
-  if (!isTradingSession()) {
-    return;
-  }
-
-  for (const chatId of users) {
-    if (!activeSignals.has(chatId)) {
-      await scanAndSendNext(chatId);
-    }
-  }
-}
-
-/* =========================================================
-   DAILY SESSION
-========================================================= */
-
-let lastSessionHour = null;
-
-async function sessionManager() {
-  const hour = lagosHour();
-
-  if (lastSessionHour === null) {
-    lastSessionHour = hour;
-    return;
-  }
-
-  // 8 PM WAT — stop new signals and send report.
-  if (hour === 20 && lastSessionHour !== 20) {
-    for (const chatId of users) {
-      await sendDailyReport(chatId);
-    }
-
-    console.log(
-      "🛑 8 PM WAT — new signals stopped."
-    );
-  }
-
-  // 9 PM WAT — new session.
-  if (hour === 21 && lastSessionHour !== 21) {
-    stats.clear();
-    lastSignalCandle.clear();
-
-    console.log(
-      "🚀 9 PM WAT — new trading session started."
-    );
-
-    for (const chatId of users) {
-      setTimeout(() => {
-        scanAndSendNext(chatId);
-      }, 1000);
-    }
-  }
-
-  lastSessionHour = hour;
-}
-
-/* =========================================================
-   REPORT
-========================================================= */
-
-async function sendDailyReport(chatId) {
-  const s = stats.get(chatId) || {
-    trades: 0,
-    wins: 0,
-    losses: 0,
-    pairs: {}
-  };
-
-  const winRate =
-    s.trades > 0
-      ? ((s.wins / s.trades) * 100).toFixed(1)
-      : "0.0";
-
-  let pairText = "";
-
-  const pairs = Object.entries(s.pairs)
-    .sort((a, b) => b[1].trades - a[1].trades)
-    .slice(0, 10);
-
-  for (const [symbol, p] of pairs) {
-    pairText +=
-      `\n${symbol}: ${p.wins}W / ${p.losses}L`;
-  }
+  const poolAge = signalPoolUpdatedAt
+    ? `${Math.round((Date.now() - signalPoolUpdatedAt) / 1000)}s ago`
+    : "not scanned yet";
 
   await bot.sendMessage(
     chatId,
-    `
-📊 DAILY SIGNAL REPORT
+    `📊 MARKET STATUS
 
-📈 Trades: ${s.trades}
-🏆 Wins: ${s.wins}
-🔴 Losses: ${s.losses}
-🎯 Win Rate: ${winRate}%
+🕐 Nigeria Time:
+${formatNigeriaTime()}
 
-💱 Pair Performance
-${pairText || "\nNo completed trades."}
+📡 Session:
+${session === "ACTIVE" ? "🟢 ACTIVE" : "💤 BREAK"}
 
-💵 Risk Setting: ${RISK_PERCENT}% of Capital
+📊 Analysis:
+${ANALYSIS_TIMEFRAME.toUpperCase()}
 
-🛑 New signals stop at 8:00 PM WAT.
-`.trim()
+⌛ Expiry:
+${EXPIRY_MINUTES}M
+
+💱 Configured Pairs:
+${PAIRS.length}
+
+🔄 Continuous Scanning:
+ON
+
+🛰 Data Engine:
+${apiStatus}
+
+🕓 Last full scan:
+${poolAge}`
   );
-}
+});
 
-/* =========================================================
-   TELEGRAM
-========================================================= */
+// =====================================================
+// /RESULTS
+// =====================================================
 
-bot.onText(/^\/start$/, async msg => {
+bot.onText(/^\/results$/, async (msg) => {
+  const chatId = msg.chat.id;
+
+  users.add(chatId);
+
+  const total = dailyStats.trades;
+
+  const winRate =
+    total === 0
+      ? "0.00"
+      : ((dailyStats.wins / total) * 100).toFixed(2);
+
+  await bot.sendMessage(
+    chatId,
+    `📊 TODAY'S RESULTS
+
+🏁 Trades:
+${total}
+
+🏆 Wins:
+${dailyStats.wins}
+
+❌ Losses:
+${dailyStats.losses}
+
+📈 Win Rate:
+${winRate}%
+
+💵 Risk Setting:
+${RISK_PERCENT}% of Capital
+
+⚠️ Monetary profit/loss is not calculated because the bot does not have access to your Pocket Option balance or payout.`
+  );
+});
+
+// =====================================================
+// /PAIRS
+// =====================================================
+
+bot.onText(/^\/pairs$/, async (msg) => {
   const chatId = msg.chat.id;
 
   users.add(chatId);
 
   await bot.sendMessage(
     chatId,
-    `
-🚀 BINARY SIGNAL BOT
+    `💱 CONFIGURED PAIRS
 
-Connected successfully.
+${PAIRS.map((pair, i) => `${i + 1}. ${pair}`).join("\n")}
 
-💱 Pocket Option OTC Currency Pairs
-⏱ 1-Minute Analysis
-⌛ 1-Minute Expiry
-🧠 SMC + FVG + Order Block
-💧 Liquidity + Confirmation
-
-🔒 ONE SIGNAL AT A TIME
-
-After the result:
-🔄 The bot scans the OTC currency pairs again.
-
-⚠️ Signals are analytical, not guaranteed results.
-`.trim()
-  );
-
-  if (isTradingSession()) {
-    setTimeout(() => {
-      scanAndSendNext(chatId);
-    }, 1000);
-  }
-});
-
-bot.onText(/^\/signal$/, msg => {
-  users.add(msg.chat.id);
-
-  scanAndSendNext(msg.chat.id);
-});
-
-bot.onText(/^\/results$/, msg => {
-  const s = stats.get(msg.chat.id);
-
-  if (!s) {
-    return bot.sendMessage(
-      msg.chat.id,
-      "📊 No completed trades yet."
-    );
-  }
-
-  const winRate =
-    s.trades > 0
-      ? ((s.wins / s.trades) * 100).toFixed(1)
-      : "0.0";
-
-  bot.sendMessage(
-    msg.chat.id,
-    `
-📊 CURRENT RESULTS
-
-Trades: ${s.trades}
-🏆 Wins: ${s.wins}
-🔴 Losses: ${s.losses}
-🎯 Win Rate: ${winRate}%
-`.trim()
+🔎 The engine scans all configured pairs and selects the strongest confirmed setup.`
   );
 });
 
-bot.onText(/^\/pairs$/, async msg => {
-  try {
-    const pairs = await refreshSymbols();
+// =====================================================
+// /HELP
+// =====================================================
 
-    const text =
-      pairs
-        .map(
-          (p, i) =>
-            `${i + 1}. ${p.name}`
-        )
-        .join("\n");
+bot.onText(/^\/help$/, async (msg) => {
+  const chatId = msg.chat.id;
 
-    await bot.sendMessage(
-      msg.chat.id,
-      `💱 POCKET OPTION OTC CURRENCY PAIRS\n\n${text}`
-    );
-  } catch (err) {
-    bot.sendMessage(
-      msg.chat.id,
-      `❌ Could not load pairs.\n${err.message}`
-    );
-  }
-});
+  users.add(chatId);
 
-bot.onText(/^\/help$/, msg => {
-  bot.sendMessage(
-    msg.chat.id,
-    `
-📚 COMMANDS
+  await bot.sendMessage(
+    chatId,
+    `ℹ️ BINARY SIGNAL PRO
 
-/start — Start bot
-/signal — Search for next signal
-/results — Current results
-/pairs — OTC currency pairs
+Commands:
+
+/start — Start the bot
+/signal — Scan for a signal
+/market — Market status
+/results — Today's results
+/pairs — Configured pairs
 /help — Help
 
-🔒 Only ONE active trade at a time.
-`.trim()
+📊 Analysis: 1M
+⌛ Expiry: 1M
+
+🔄 Automatic scanning remains ON while the trading session is active.`
   );
 });
 
-/* =========================================================
-   HEALTH SERVER
-========================================================= */
+// =====================================================
+// API ERROR HANDLING (shared quota circuit breaker)
+// =====================================================
 
-app.get("/", (req, res) => {
-  res.json({
-    status: "online",
-    bot: "Pocket Option OTC Binary Signal Bot",
-    timeframe: "1m",
-    expiry: "1m",
-    otcCurrencyPairs: otcSymbols.length,
-    activeSignals: activeSignals.size,
-    users: users.size
-  });
-});
+function nextUtcMidnight() {
+  const d = new Date();
+  d.setUTCHours(24, 0, 0, 0);
+  return d.getTime();
+}
 
-/* =========================================================
-   START
-========================================================= */
+function isQuotaError(message, status) {
+  const m = String(message || "").toLowerCase();
 
-async function start() {
-  console.log("🚀 STARTING POCKET OPTION OTC SIGNAL BOT...");
-
-  await refreshSymbols(true);
-
-  console.log(
-    `💱 OTC currency pairs available: ${otcSymbols.length}`
-  );
-
-  // Load initial candles.
-  await loadHistoryForPairs();
-
-  // Start live stream.
-  startOTCStream()
-    .catch(err => {
-      console.log(
-        `❌ OTC stream stopped: ${err.message}`
-      );
-
-      setTimeout(() => {
-        startOTCStream().catch(console.error);
-      }, 5000);
-    });
-
-  // Result checker.
-  setInterval(
-    checkResults,
-    RESULT_CHECK_MS
-  );
-
-  // Finds users who have no active trade.
-  setInterval(
-    automaticScanner,
-    SCAN_RETRY_MS
-  );
-
-  // Session manager.
-  setInterval(
-    sessionManager,
-    30000
-  );
-
-  app.listen(PORT, () => {
-    console.log(
-      `🌐 Server running on port ${PORT}`
-    );
-  });
-
-  console.log(
-    "✅ POCKET OPTION OTC SIGNAL BOT READY"
+  return (
+    status === 429 ||
+    m.includes("run out of api credits") ||
+    m.includes("api credits") ||
+    m.includes("too many requests")
   );
 }
 
-start().catch(err => {
-  console.error(
-    "💥 FATAL STARTUP ERROR:",
-    err
+function handleApiError(label, message, status) {
+  if (isQuotaError(message, status)) {
+    if (/daily|800|day/i.test(String(message))) {
+      apiQuotaBlockedUntil = nextUtcMidnight();
+    } else {
+      // Likely a per-minute limit - back off briefly, not all day.
+      apiQuotaBlockedUntil = Date.now() + 65 * 1000;
+    }
+
+    apiQuotaMessage = String(message);
+
+    if (Date.now() - lastApiQuotaLog > 30000) {
+      console.error(
+        `${label}: Twelve Data quota/rate limit: ${message}`
+      );
+      console.error(
+        `API calls paused until ${new Date(
+          apiQuotaBlockedUntil
+        ).toISOString()}`
+      );
+      lastApiQuotaLog = Date.now();
+    }
+
+    return true;
+  }
+
+  console.error(`❌ ${label}: ${message}`);
+  return false;
+}
+
+// =====================================================
+// TWELVE DATA CANDLES
+// =====================================================
+
+async function getCandles(symbol) {
+  const url =
+    "https://api.twelvedata.com/time_series" +
+    `?symbol=${encodeURIComponent(symbol)}` +
+    `&interval=${ANALYSIS_TIMEFRAME}` +
+    `&outputsize=80` +
+    `&timezone=UTC` +
+    `&apikey=${TWELVE_DATA_API_KEY}`;
+
+  const response = await fetch(url);
+
+  const data = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    const error = new Error(
+      data?.message || `HTTP ${response.status}`
+    );
+    error.status = response.status;
+    throw error;
+  }
+
+  if (data?.status === "error") {
+    const error = new Error(data.message || "Twelve Data error");
+    error.status = data.code;
+    throw error;
+  }
+
+  if (!Array.isArray(data?.values)) {
+    throw new Error("No candle data");
+  }
+
+  return data.values
+    .map((c) => ({
+      time: c.datetime,
+      open: Number(c.open),
+      high: Number(c.high),
+      low: Number(c.low),
+      close: Number(c.close)
+    }))
+    .reverse();
+}
+
+// =====================================================
+// CANDLE HELPERS
+// =====================================================
+
+function bullish(c) {
+  return c.close > c.open;
+}
+
+function bearish(c) {
+  return c.close < c.open;
+}
+
+function body(c) {
+  return Math.abs(c.close - c.open);
+}
+
+function averageBody(candles, count = 10) {
+  const data = candles.slice(-count);
+
+  if (!data.length) {
+    return 0;
+  }
+
+  return data.reduce((sum, c) => sum + body(c), 0) / data.length;
+}
+
+// =====================================================
+// TREND
+// =====================================================
+
+function getTrend(candles) {
+  const recent = candles.slice(-15);
+
+  let up = 0;
+  let down = 0;
+
+  for (let i = 1; i < recent.length; i++) {
+    if (recent[i].close > recent[i - 1].close) {
+      up++;
+    }
+
+    if (recent[i].close < recent[i - 1].close) {
+      down++;
+    }
+  }
+
+  if (up >= down + 4) {
+    return "BULLISH";
+  }
+
+  if (down >= up + 4) {
+    return "BEARISH";
+  }
+
+  return "NEUTRAL";
+}
+
+// =====================================================
+// FAIR VALUE GAP
+// =====================================================
+
+function detectFVG(candles) {
+  if (candles.length < 5) {
+    return null;
+  }
+
+  const a = candles[candles.length - 4];
+  const c = candles[candles.length - 2];
+
+  // Bullish FVG
+  if (c.low > a.high) {
+    return {
+      type: "BULLISH",
+      low: a.high,
+      high: c.low
+    };
+  }
+
+  // Bearish FVG
+  if (c.high < a.low) {
+    return {
+      type: "BEARISH",
+      low: c.high,
+      high: a.low
+    };
+  }
+
+  return null;
+}
+
+// =====================================================
+// ORDER BLOCK
+// =====================================================
+
+function detectOrderBlock(candles) {
+  if (candles.length < 6) {
+    return null;
+  }
+
+  const previous = candles[candles.length - 3];
+  const impulse = candles[candles.length - 2];
+
+  const avg = averageBody(candles);
+
+  // Bullish Order Block
+  if (
+    bearish(previous) &&
+    bullish(impulse) &&
+    body(impulse) >= avg * 1.25
+  ) {
+    return {
+      type: "BULLISH",
+      low: previous.low,
+      high: previous.high
+    };
+  }
+
+  // Bearish Order Block
+  if (
+    bullish(previous) &&
+    bearish(impulse) &&
+    body(impulse) >= avg * 1.25
+  ) {
+    return {
+      type: "BEARISH",
+      low: previous.low,
+      high: previous.high
+    };
+  }
+
+  return null;
+}
+
+// =====================================================
+// LIQUIDITY
+// =====================================================
+
+function liquidityDirection(candles) {
+  const recent = candles.slice(-8);
+
+  if (recent.length < 3) {
+    return "NONE";
+  }
+
+  const highs = recent.map((c) => c.high);
+  const lows = recent.map((c) => c.low);
+
+  const last = recent[recent.length - 1];
+
+  const previousHigh = Math.max(...highs.slice(0, -1));
+  const previousLow = Math.min(...lows.slice(0, -1));
+
+  if (last.close > previousHigh) {
+    return "BULLISH";
+  }
+
+  if (last.close < previousLow) {
+    return "BEARISH";
+  }
+
+  return "NONE";
+}
+
+// =====================================================
+// CONFIRMATION
+// =====================================================
+
+function confirmation(candles) {
+  if (candles.length < 5) {
+    return "WEAK";
+  }
+
+  // Use last completed candle
+  const c = candles[candles.length - 2];
+
+  const avg = averageBody(candles);
+
+  if (body(c) < avg * 0.8) {
+    return "WEAK";
+  }
+
+  if (bullish(c) && body(c) >= avg) {
+    return "BULLISH";
+  }
+
+  if (bearish(c) && body(c) >= avg) {
+    return "BEARISH";
+  }
+
+  return "WEAK";
+}
+
+// =====================================================
+// SMC ANALYSIS
+// =====================================================
+
+function analyze(symbol, candles) {
+  if (candles.length < 20) {
+    return null;
+  }
+
+  const trend = getTrend(candles);
+  const fvg = detectFVG(candles);
+  const ob = detectOrderBlock(candles);
+  const liquidity = liquidityDirection(candles);
+  const confirm = confirmation(candles);
+
+  let buy = 0;
+  let sell = 0;
+
+  // Trend
+  if (trend === "BULLISH") {
+    buy += 2;
+  }
+
+  if (trend === "BEARISH") {
+    sell += 2;
+  }
+
+  // FVG
+  if (fvg?.type === "BULLISH") {
+    buy += 2;
+  }
+
+  if (fvg?.type === "BEARISH") {
+    sell += 2;
+  }
+
+  // Order Block
+  if (ob?.type === "BULLISH") {
+    buy += 2;
+  }
+
+  if (ob?.type === "BEARISH") {
+    sell += 2;
+  }
+
+  // Liquidity
+  if (liquidity === "BULLISH") {
+    buy += 1;
+  }
+
+  if (liquidity === "BEARISH") {
+    sell += 1;
+  }
+
+  // Confirmation
+  if (confirm === "BULLISH") {
+    buy += 2;
+  }
+
+  if (confirm === "BEARISH") {
+    sell += 2;
+  }
+
+  const score = Math.max(buy, sell);
+
+  if (score < 7) {
+    return null;
+  }
+
+  let direction;
+
+  if (buy > sell) {
+    direction = "BUY";
+  } else if (sell > buy) {
+    direction = "SELL";
+  } else {
+    return null;
+  }
+
+  const confidence = Math.min(95, 55 + score * 5);
+
+  if (confidence < MIN_CONFIDENCE) {
+    return null;
+  }
+
+  // Last candle
+  const latestCandle = candles[candles.length - 1];
+
+  return {
+    symbol,
+    direction,
+    confidence,
+    score,
+    trend,
+    fvg: fvg?.type || "NONE",
+    orderBlock: ob?.type || "NONE",
+    liquidity,
+    confirmation: confirm,
+    entry: latestCandle.close,
+    candleTime: latestCandle.time,
+    createdAt: Date.now()
+  };
+}
+
+// =====================================================
+// SIGNAL MESSAGE
+// =====================================================
+
+function signalMessage(signal) {
+  const now = new Intl.DateTimeFormat("en-US", {
+    timeZone: TIMEZONE,
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true
+  }).format(new Date());
+
+  const arrow = signal.direction === "BUY" ? "🟢 BUY" : "🔴 SELL";
+
+  return `🚨 BINARY SIGNAL 🚨
+
+⏱ Trade Time: ${now}
+
+💱 ${signal.symbol} → ${arrow}
+
+⌛ Expiry: 1M
+
+📊 Confidence: ${signal.confidence}%
+
+📈 SIGNAL RULES
+
+💵 Risk: ${RISK_PERCENT}% of Capital
+
+🧠 CONFIRMATION
+
+📈 Trend: ${signal.trend}
+💎 FVG: ${signal.fvg}
+📦 Order Block: ${signal.orderBlock}
+💧 Liquidity: ${signal.liquidity}
+🕯 Confirmation: ${signal.confirmation}
+
+🔄 CONTINUOUS SCANNING
+
+⚠️ Confidence is a strategy score,
+not a guaranteed win probability.`;
+}
+
+// =====================================================
+// SEND SIGNAL
+// =====================================================
+
+async function sendSignal(chatId, signal) {
+  const id = `${chatId}_${signal.symbol}_${Date.now()}`;
+
+  activeSignals.set(id, {
+    ...signal,
+    chatId,
+    id,
+    expiryAt: Date.now() + EXPIRY_MINUTES * 60 * 1000
+  });
+
+  lastSignalCandle.set(`${chatId}_${signal.symbol}`, signal.candleTime);
+
+  await bot.sendMessage(chatId, signalMessage(signal));
+
+  console.log(
+    `📡 SENT ${signal.symbol} ${signal.direction} ${signal.confidence}% → ${chatId}`
+  );
+}
+
+// =====================================================
+// SHARED SCAN - fetches every pair ONCE per cycle and
+// builds signalPool. Shared by every user.
+// =====================================================
+
+async function refreshAllCandles() {
+  if (refreshing) {
+    return;
+  }
+
+  if (Date.now() < apiQuotaBlockedUntil) {
+    return;
+  }
+
+  refreshing = true;
+
+  const found = [];
+
+  try {
+    for (const pair of PAIRS) {
+      if (Date.now() < apiQuotaBlockedUntil) {
+        // Quota/rate-limit hit mid-scan - stop hammering
+        // the remaining pairs this cycle.
+        break;
+      }
+
+      try {
+        const candles = await getCandles(pair);
+
+        candleCache.set(pair, {
+          candles,
+          lastUpdated: Date.now()
+        });
+
+        const signal = analyze(pair, candles);
+
+        if (signal) {
+          found.push(signal);
+        }
+      } catch (error) {
+        handleApiError(`getCandles(${pair})`, error.message, error.status);
+      }
+
+      await sleep(FETCH_DELAY_MS);
+    }
+
+    found.sort((a, b) => b.confidence - a.confidence);
+
+    signalPool = found;
+    signalPoolUpdatedAt = Date.now();
+  } finally {
+    refreshing = false;
+  }
+}
+
+async function refreshAllCandlesIfDue() {
+  const stale =
+    !signalPoolUpdatedAt ||
+    Date.now() - signalPoolUpdatedAt >= SCAN_INTERVAL;
+
+  if (!stale) {
+    return;
+  }
+
+  await refreshAllCandles();
+}
+
+// =====================================================
+// PICK A SIGNAL FROM THE SHARED POOL FOR ONE USER
+// (skips setups already sent to that user on this candle)
+// =====================================================
+
+function pickSignalForUser(chatId) {
+  return signalPool.find((signal) => {
+    const key = `${chatId}_${signal.symbol}`;
+    const previousCandle = lastSignalCandle.get(key);
+
+    return !(previousCandle && previousCandle === signal.candleTime);
+  });
+}
+
+// =====================================================
+// MANUAL SIGNAL
+// =====================================================
+
+async function sendBestSignal(chatId) {
+  if (currentSessionState() !== "ACTIVE") {
+    await bot.sendMessage(
+      chatId,
+      `💤 SIGNAL SESSION IS OFF
+
+⏰ The bot is currently in the 8:00 PM – 9:00 PM Nigeria break.
+
+🟢 New signals resume at 9:00 PM.`
+    );
+
+    return;
+  }
+
+  await bot.sendMessage(
+    chatId,
+    "🔎 Scanning all configured pairs for the strongest confirmed 1M setup..."
   );
 
-  process.exit(1);
-});
+  // Reuses the shared pool if it's still fresh - does NOT
+  // trigger a new fetch per user.
+  await refreshAllCandlesIfDue();
+
+  if (Date.now() < apiQuotaBlockedUntil) {
+    await bot.sendMessage(
+      chatId,
+      `⚠️ DATA ENGINE TEMPORARILY LIMITED
+
+The market data provider is rate-limiting requests right now.
+
+🔄 It will resume automatically - please try again shortly.`
+    );
+
+    return;
+  }
+
+  const candidate = pickSignalForUser(chatId);
+
+  if (!candidate) {
+    await bot.sendMessage(
+      chatId,
+      `⏳ NO HIGH-QUALITY SIGNAL
+
+The engine did not find a sufficiently strong confirmed setup.
+
+🔄 It will continue scanning.`
+    );
+
+    return;
+  }
+
+  await sendSignal(chatId, candidate);
+}
+
+// =====================================================
+// AUTOMATIC SCANNER
+// =====================================================
+
+async function automaticScanner() {
+  if (currentSessionState() !== "ACTIVE") {
+    return;
+  }
+
+  await refreshAllCandlesIfDue();
+
+  if (!signalPool.length) {
+    return;
+  }
+
+  for (const chatId of users) {
+    // Only one active signal per user
+    const hasActiveSignal = [...activeSignals.values()].some(
+      (signal) => signal.chatId === chatId
+    );
+
+    if (hasActiveSignal) {
+      continue;
+    }
+
+    const candidate = pickSignalForUser(chatId);
+
+    if (!candidate) {
+      continue;
+    }
+
+    try {
+      await sendSignal(chatId, candidate);
+
+      console.log(
+        `🚨 SIGNAL ${candidate.symbol} ${candidate.direction} ${candidate.confidence}%`
+      );
+    } catch (error) {
+      console.error("❌ Scanner error:", error.message);
+    }
+  }
+}
+
+// =====================================================
+// CHECK RESULTS
+//
+// Fetches fresh candles only for symbols that actually
+// have a due signal (bounded by active signals, not by
+// PAIRS x users), grouped so each symbol is fetched once
+// per cycle even if several users hold a signal on it.
+// =====================================================
+
+async function checkResults() {
+  if (checkingResults) {
+    return;
+  }
+
+  checkingResults = true;
+
+  try {
+    const now = Date.now();
+
+    const dueEntries = [...activeSignals.entries()].filter(
+      ([, signal]) => now >= signal.expiryAt
+    );
+
+    if (!dueEntries.length) {
+      return;
+    }
+
+    if (Date.now() < apiQuotaBlockedUntil) {
+      // Leave due signals pending - they'll be evaluated
+      // on the next cycle once the quota/rate-limit clears.
+      return;
+    }
+
+    const symbolsNeeded = [
+      ...new Set(dueEntries.map(([, signal]) => signal.symbol))
+    ];
+
+    const freshCandles = new Map();
+
+    for (const symbol of symbolsNeeded) {
+      if (Date.now() < apiQuotaBlockedUntil) {
+        break;
+      }
+
+      try {
+        const candles = await getCandles(symbol);
+
+        candleCache.set(symbol, {
+          candles,
+          lastUpdated: Date.now()
+        });
+
+        freshCandles.set(symbol, candles);
+      } catch (error) {
+        handleApiError(
+          `checkResults(${symbol})`,
+          error.message,
+          error.status
+        );
+      }
+
+      await sleep(FETCH_DELAY_MS);
+    }
+
+    for (const [id, signal] of dueEntries) {
+      const candles = freshCandles.get(signal.symbol);
+
+      if (!candles) {
+        // Couldn't fetch this symbol this cycle - leave the
+        // signal in place and retry on the next cycle rather
+        // than silently discarding the trade result.
+        continue;
+      }
+
+      const last = candles[candles.length - 1];
+
+      const entry = signal.entry;
+      const finalPrice = last.close;
+
+      let win = false;
+
+      if (signal.direction === "BUY") {
+        win = finalPrice > entry;
+      }
+
+      if (signal.direction === "SELL") {
+        win = finalPrice < entry;
+      }
+
+      dailyStats.trades++;
+
+      if (!dailyStats.pairs[signal.symbol]) {
+        dailyStats.pairs[signal.symbol] = {
+          wins: 0,
+          losses: 0
+        };
+      }
+
+      if (win) {
+        dailyStats.wins++;
+        dailyStats.pairs[signal.symbol].wins++;
+
+        await bot.sendMessage(
+          signal.chatId,
+          `🏆 RESULT: WIN 🟢
+
+💱 ${signal.symbol}
+
+📈 Direction:
+${signal.direction}
+
+⌛ Expiry:
+1M
+
+💰 Entry:
+${entry}
+
+💰 Result:
+${finalPrice}
+
+🏆 WIN
+
+🔄 Scanning all pairs again for the next confirmed setup...`
+        );
+      } else {
+        dailyStats.losses++;
+        dailyStats.pairs[signal.symbol].losses++;
+
+        await bot.sendMessage(
+          signal.chatId,
+          `❌ RESULT: LOSS 🔴
+
+💱 ${signal.symbol}
+
+📉 Direction:
+${signal.direction}
+
+⌛ Expiry:
+1M
+
+💰 Entry:
+${entry}
+
+💰 Result:
+${finalPrice}
+
+❌ LOSS
+
+🔄 Scanning all pairs again for the next confirmed setup...`
+        );
+      }
+
+      activeSignals.delete(id);
+    }
+  } finally {
+    checkingResults = false;
+  }
+}
+
+// =====================================================
+// DAILY REPORT
+// =====================================================
+
+async function sendDailyReport(chatId) {
+  const total = dailyStats.trades;
+
+  const winRate =
+    total === 0
+      ? "0.00"
+      : ((dailyStats.wins / total) * 100).toFixed(2);
+
+  const pairLines =
+    Object.entries(dailyStats.pairs)
+      .map(
+        ([pair, stats]) =>
+          `💱 ${pair}: ${stats.wins}W / ${stats.losses}L`
+      )
+      .join("\n") || "No completed trades.";
+
+  await bot.sendMessage(
+    chatId,
+    `📊 DAILY SIGNAL REPORT
+
+📅 Date:
+${nigeriaDate()}
+
+━━━━━━━━━━━━━━
+
+🏁 Total Trades:
+${total}
+
+🏆 Wins:
+${dailyStats.wins}
+
+❌ Losses:
+${dailyStats.losses}
+
+📈 Win Rate:
+${winRate}%
+
+━━━━━━━━━━━━━━
+
+💱 PAIR PERFORMANCE
+
+${pairLines}
+
+━━━━━━━━━━━━━━
+
+📊 Analysis:
+1M
+
+⌛ Expiry:
+1M
+
+💵 Risk Setting:
+${RISK_PERCENT}% of Capital
+
+⚠️ Monetary P/L is not calculated because the bot does not have access to your Pocket Option account balance or actual payout.
+
+🔴 Trading session closed.
+
+⏰ Next session:
+9:00 PM Nigeria time.`
+  );
+}
+
+// =====================================================
+// DAILY SCHEDULE
+// =====================================================
+
+async function dailySchedule() {
+  const t = nigeriaTimeParts();
+
+  const today = nigeriaDate();
+
+  // 8:00 PM Nigeria time
+  if (t.hour === 20 && t.minute === 0 && lastReportDate !== today) {
+    lastReportDate = today;
+
+    // Stop active signals
+    activeSignals.clear();
+
+    for (const chatId of users) {
+      try {
+        await sendDailyReport(chatId);
+      } catch (error) {
+        console.error("❌ Report error:", error.message);
+      }
+    }
+
+    resetDailyStats();
+
+    console.log("📊 Daily report sent. Trading session closed.");
+  }
+}
+
+// =====================================================
+// START AUTOMATIC LOOPS
+// =====================================================
+
+setInterval(automaticScanner, SCAN_INTERVAL);
+
+setInterval(checkResults, RESULT_CHECK_INTERVAL);
+
+setInterval(dailySchedule, 1000);
+
+// =====================================================
+// STARTUP LOG
+// =====================================================
+
+console.log("🚀 BINARY SIGNAL PRO STARTED");
+console.log("📊 Analysis timeframe: 1min");
+console.log("⌛ Expiry: 1M");
+console.log("🔄 Scan interval: 60 seconds");
+console.log("💱 Pairs:", PAIRS.length);
+console.log("🧠 SMC confirmation: ON");
+console.log("🌐 Public users: ENABLED");
+console.log("🚫 Custom menu buttons: REMOVED");
+console.log("🔄 Continuous scanning: ON");
+console.log(
+  `🛰 Shared scan: 1 fetch/pair/cycle, ${FETCH_DELAY_MS}ms spacing`
+);
