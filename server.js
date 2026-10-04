@@ -1,10 +1,3 @@
-// ================================================================
-// 🚨 BINARY SIGNAL PRO
-// Telegram + Twelve Data
-// 5M analysis / 1M expiry
-// SIGNAL ONLY — NO AUTOMATIC POCKET OPTION TRADING
-// ================================================================
-
 const TelegramBot = require("node-telegram-bot-api");
 const express = require("express");
 
@@ -16,22 +9,23 @@ const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY;
 
 const TIMEZONE = "Africa/Lagos";
 
-// ================================================================
+// ===============================
 // SETTINGS
-// ================================================================
+// ===============================
 
 const ANALYSIS_TIMEFRAME = "5min";
 const EXPIRY_MINUTES = 1;
 
-const SCAN_INTERVAL = 15 * 1000;
+// Scan every 60 seconds to reduce API usage.
+const SCAN_INTERVAL = 60 * 1000;
 const RESULT_CHECK_INTERVAL = 10 * 1000;
 
 const MIN_CONFIDENCE = 76;
 const RISK_PERCENT = 5;
 
-// ================================================================
+// ===============================
 // PAIRS
-// ================================================================
+// ===============================
 
 const PAIRS = [
   "EUR/USD",
@@ -46,9 +40,9 @@ const PAIRS = [
   "GBP/JPY"
 ];
 
-// ================================================================
-// STARTUP CHECK
-// ================================================================
+// ===============================
+// BASIC CHECKS
+// ===============================
 
 if (!BOT_TOKEN) {
   console.error("❌ BOT_TOKEN is missing");
@@ -60,18 +54,22 @@ if (!TWELVE_DATA_API_KEY) {
   process.exit(1);
 }
 
+// ===============================
+// TELEGRAM
+// ===============================
+
 const bot = new TelegramBot(BOT_TOKEN, {
   polling: true
 });
 
-// ================================================================
-// MEMORY
-// ================================================================
-
+// Users who have started the bot.
+// Anyone can use the bot by sending /start.
 const users = new Set();
 
+// Active signals
 const activeSignals = new Map();
 
+// Daily statistics
 const dailyStats = {
   trades: 0,
   wins: 0,
@@ -81,11 +79,14 @@ const dailyStats = {
   pairs: {}
 };
 
-let currentTradingDay = null;
+let lastReportDate = null;
 
-// ================================================================
-// EXPRESS
-// ================================================================
+// Prevent duplicate signals on the same setup/candle
+const lastSignalCandle = new Map();
+
+// ===============================
+// WEB SERVER
+// ===============================
 
 app.get("/", (req, res) => {
   res.send("🚨 Binary Signal Pro is running");
@@ -98,6 +99,7 @@ app.get("/health", (req, res) => {
     timezone: TIMEZONE,
     analysis: ANALYSIS_TIMEFRAME,
     expiry: `${EXPIRY_MINUTES}M`,
+    users: users.size,
     activeSignals: activeSignals.size
   });
 });
@@ -106,9 +108,9 @@ app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
 
-// ================================================================
-// NIGERIA TIME
-// ================================================================
+// ===============================
+// TIME
+// ===============================
 
 function nigeriaTimeParts() {
   const parts = new Intl.DateTimeFormat("en-GB", {
@@ -143,23 +145,31 @@ function nigeriaDate() {
   }).format(new Date());
 }
 
+// ===============================
+// SESSION
+// ===============================
+//
+// ACTIVE:
+// 9:00 PM → 8:00 PM next day
+//
+// BREAK:
+// 8:00 PM → 9:00 PM
+// ===============================
+
 function currentSessionState() {
   const t = nigeriaTimeParts();
-
   const minutes = t.hour * 60 + t.minute;
 
-  // Active from 9:00 PM until 8:00 PM next day.
   if (minutes >= 21 * 60 || minutes < 20 * 60) {
     return "ACTIVE";
   }
 
-  // 8:00 PM - 8:59:59 PM break/report period.
   return "BREAK";
 }
 
-// ================================================================
-// RESET DAILY STATISTICS
-// ================================================================
+// ===============================
+// DAILY RESET
+// ===============================
 
 function resetDailyStats() {
   dailyStats.trades = 0;
@@ -168,155 +178,195 @@ function resetDailyStats() {
   dailyStats.profit = 0;
   dailyStats.loss = 0;
   dailyStats.pairs = {};
+
+  lastSignalCandle.clear();
 }
 
-// ================================================================
-// USER MENU
-// ================================================================
-
-function mainMenu() {
-  return {
-    reply_markup: {
-      keyboard: [
-        ["📡 SIGNAL", "📊 MARKET"],
-        ["📈 RESULTS", "💱 PAIRS"],
-        ["ℹ️ HOW IT WORKS"]
-      ],
-      resize_keyboard: true
-    }
-  };
-}
-
-// ================================================================
-// START
-// ================================================================
+// ===============================
+// /START
+// ===============================
+//
+// NO MENU BUTTONS.
+// EVERY USER CAN START THE BOT.
+// ===============================
 
 bot.onText(/^\/start$/, async (msg) => {
+  const chatId = msg.chat.id;
+
+  // Register user
+  users.add(chatId);
+
+  console.log(`👤 User registered: ${chatId}`);
+
+  const session = currentSessionState();
+
+  let message = `
+🚨 BINARY SIGNAL PRO 🚨
+
+Welcome to the signal engine.
+
+🧠 SMC ANALYSIS
+📊 5M TIMEFRAME
+⌛ 1M EXPIRY
+🔄 CONTINUOUS SCANNING
+
+The engine checks:
+
+📈 Trend
+💎 Fair Value Gap
+📦 Order Block
+💧 Liquidity
+🕯 Confirmation
+
+Only sufficiently strong setups can become signals.
+
+🏆 WIN / ❌ LOSS
+After every completed trade, the engine scans again.
+
+⚠️ Signals are not guaranteed profits.
+`;
+
+  if (session === "ACTIVE") {
+    message += `
+🟢 STATUS: ACTIVE
+
+🔎 The engine is scanning for the strongest confirmed setup.
+`;
+
+  } else {
+    message += `
+💤 STATUS: BREAK
+
+⏰ Next session starts at 9:00 PM Nigeria time.
+`;
+  }
+
+  await bot.sendMessage(chatId, message);
+});
+
+// ===============================
+// OPTIONAL COMMANDS
+// ===============================
+
+bot.onText(/^\/signal$/, async (msg) => {
+  const chatId = msg.chat.id;
+
+  users.add(chatId);
+
+  await sendBestSignal(chatId);
+});
+
+bot.onText(/^\/market$/, async (msg) => {
+  const chatId = msg.chat.id;
+
+  users.add(chatId);
+
+  const session = currentSessionState();
+
+  await bot.sendMessage(
+    chatId,
+    `📊 MARKET STATUS
+
+🕐 Nigeria Time: ${formatNigeriaTime()}
+
+📡 Session: ${
+      session === "ACTIVE" ? "🟢 ACTIVE" : "💤 BREAK"
+    }
+
+📊 Analysis: ${ANALYSIS_TIMEFRAME.toUpperCase()}
+
+⌛ Expiry: ${EXPIRY_MINUTES}M
+
+💱 Configured Pairs: ${PAIRS.length}
+
+🔄 Continuous Scanning: ON`
+  );
+});
+
+bot.onText(/^\/results$/, async (msg) => {
+  const chatId = msg.chat.id;
+
+  users.add(chatId);
+
+  const total = dailyStats.trades;
+
+  const winRate =
+    total === 0
+      ? 0
+      : ((dailyStats.wins / total) * 100).toFixed(2);
+
+  await bot.sendMessage(
+    chatId,
+    `📊 TODAY'S RESULTS
+
+🏁 Trades: ${total}
+
+🏆 Wins: ${dailyStats.wins}
+
+❌ Losses: ${dailyStats.losses}
+
+📈 Win Rate: ${winRate}%
+
+💵 Risk Setting: ${RISK_PERCENT}% of Capital
+
+⚠️ Monetary profit/loss is not calculated because the bot does not have access to your Pocket Option balance or payout.`
+  );
+});
+
+bot.onText(/^\/pairs$/, async (msg) => {
   const chatId = msg.chat.id;
 
   users.add(chatId);
 
   await bot.sendMessage(
     chatId,
-    `
-╔══════════════════════════╗
-     🚨 BINARY SIGNAL PRO
-╚══════════════════════════╝
+    `💱 CONFIGURED PAIRS
 
-👋 Welcome!
+${PAIRS.map((pair, i) => `${i + 1}. ${pair}`).join("\n")}
 
-⏱ Analysis: 5M
-⌛ Expiry: 1M
-
-🧠 FVG
-📦 Order Block
-📈 Trend
-💧 Liquidity
-🕯️ Confirmation
-
-━━━━━━━━━━━━━━━━━━━━
-
-🟢 CALL
-🔴 PUT
-
-💵 Risk setting: ${RISK_PERCENT}%
-
-━━━━━━━━━━━━━━━━━━━━
-
-🕘 SESSION
-9:00 PM → 8:00 PM
-
-💤 BREAK
-8:00 PM → 9:00 PM
-
-📊 Daily report: 8:00 PM
-
-⚠️ SIGNALS ONLY
-`,
-    mainMenu()
+🔎 The engine scans all configured pairs and selects the strongest confirmed setup.`
   );
 });
 
-// ================================================================
-// BUTTONS
-// ================================================================
-
-bot.on("message", async (msg) => {
-  if (!msg.text) return;
-
+bot.onText(/^\/help$/, async (msg) => {
   const chatId = msg.chat.id;
-  const text = msg.text;
 
   users.add(chatId);
 
-  if (text === "📡 SIGNAL") {
-    await sendBestSignal(chatId);
-    return;
-  }
+  await bot.sendMessage(
+    chatId,
+    `ℹ️ BINARY SIGNAL PRO
 
-  if (text === "📊 MARKET") {
-    await showMarket(chatId);
-    return;
-  }
+Commands:
 
-  if (text === "📈 RESULTS") {
-    await sendDailyReport(chatId);
-    return;
-  }
+/start — Start the bot
+/signal — Scan for a signal
+/market — Market status
+/results — Today's results
+/pairs — Configured pairs
+/help — Help
 
-  if (text === "💱 PAIRS") {
-    await bot.sendMessage(
-      chatId,
-      `
-💱 MONITORED PAIRS
-
-${PAIRS.map((p, i) => `${i + 1}️⃣ ${p}`).join("\n")}
-
-⏱ Analysis: 5M
-⌛ Expiry: 1M
-`
-    );
-    return;
-  }
-
-  if (text === "ℹ️ HOW IT WORKS") {
-    await bot.sendMessage(
-      chatId,
-      `
-🧠 SIGNAL ENGINE
-
-The bot scans the configured pairs.
-
-It checks:
-
-📈 Trend
-💎 Fair Value Gap
-📦 Order Block
-💧 Liquidity
-🕯️ Confirmation
-
-Only a sufficiently strong setup
-can become a signal.
-
-After the 1M expiry:
-
-🏆 WIN
-or
-❌ LOSS
-
-Then the engine scans again.
-
-🔄 CONTINUOUS SCANNING
-
-⚠️ Signals are not guaranteed profits.
-`
-    );
-  }
+🔄 The automatic engine continuously scans while the trading session is active.`
+  );
 });
 
-// ================================================================
+// ===============================
+// TIME FORMAT
+// ===============================
+
+function formatNigeriaTime() {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: TIMEZONE,
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true
+  }).format(new Date());
+}
+
+// ===============================
 // TWELVE DATA
-// ================================================================
+// ===============================
 
 async function getCandles(symbol) {
   const url =
@@ -344,7 +394,7 @@ async function getCandles(symbol) {
   }
 
   return data.values
-    .map(c => ({
+    .map((c) => ({
       time: c.datetime,
       open: Number(c.open),
       high: Number(c.high),
@@ -354,9 +404,9 @@ async function getCandles(symbol) {
     .reverse();
 }
 
-// ================================================================
-// CANDLE HELPERS
-// ================================================================
+// ===============================
+// CANDLE FUNCTIONS
+// ===============================
 
 function bullish(c) {
   return c.close > c.open;
@@ -373,7 +423,9 @@ function body(c) {
 function averageBody(candles, count = 10) {
   const data = candles.slice(-count);
 
-  if (!data.length) return 0;
+  if (!data.length) {
+    return 0;
+  }
 
   return (
     data.reduce((sum, c) => sum + body(c), 0) /
@@ -381,9 +433,9 @@ function averageBody(candles, count = 10) {
   );
 }
 
-// ================================================================
+// ===============================
 // TREND
-// ================================================================
+// ===============================
 
 function getTrend(candles) {
   const recent = candles.slice(-15);
@@ -392,26 +444,39 @@ function getTrend(candles) {
   let down = 0;
 
   for (let i = 1; i < recent.length; i++) {
-    if (recent[i].close > recent[i - 1].close) up++;
-    if (recent[i].close < recent[i - 1].close) down++;
+    if (recent[i].close > recent[i - 1].close) {
+      up++;
+    }
+
+    if (recent[i].close < recent[i - 1].close) {
+      down++;
+    }
   }
 
-  if (up >= down + 4) return "BULLISH";
-  if (down >= up + 4) return "BEARISH";
+  if (up >= down + 4) {
+    return "BULLISH";
+  }
+
+  if (down >= up + 4) {
+    return "BEARISH";
+  }
 
   return "NEUTRAL";
 }
 
-// ================================================================
-// FVG
-// ================================================================
+// ===============================
+// FAIR VALUE GAP
+// ===============================
 
 function detectFVG(candles) {
-  if (candles.length < 5) return null;
+  if (candles.length < 5) {
+    return null;
+  }
 
   const a = candles[candles.length - 4];
   const c = candles[candles.length - 2];
 
+  // Bullish FVG
   if (c.low > a.high) {
     return {
       type: "BULLISH",
@@ -420,6 +485,7 @@ function detectFVG(candles) {
     };
   }
 
+  // Bearish FVG
   if (c.high < a.low) {
     return {
       type: "BEARISH",
@@ -431,18 +497,21 @@ function detectFVG(candles) {
   return null;
 }
 
-// ================================================================
+// ===============================
 // ORDER BLOCK
-// ================================================================
+// ===============================
 
 function detectOrderBlock(candles) {
-  if (candles.length < 6) return null;
+  if (candles.length < 6) {
+    return null;
+  }
 
   const previous = candles[candles.length - 3];
   const impulse = candles[candles.length - 2];
 
   const avg = averageBody(candles);
 
+  // Bullish OB
   if (
     bearish(previous) &&
     bullish(impulse) &&
@@ -455,6 +524,7 @@ function detectOrderBlock(candles) {
     };
   }
 
+  // Bearish OB
   if (
     bullish(previous) &&
     bearish(impulse) &&
@@ -470,32 +540,45 @@ function detectOrderBlock(candles) {
   return null;
 }
 
-// ================================================================
+// ===============================
 // LIQUIDITY
-// ================================================================
+// ===============================
 
 function liquidityDirection(candles) {
   const recent = candles.slice(-8);
 
-  const highs = recent.map(c => c.high);
-  const lows = recent.map(c => c.low);
+  if (recent.length < 3) {
+    return "NONE";
+  }
+
+  const highs = recent.map((c) => c.high);
+  const lows = recent.map((c) => c.low);
 
   const last = recent[recent.length - 1];
 
   const previousHigh = Math.max(...highs.slice(0, -1));
   const previousLow = Math.min(...lows.slice(0, -1));
 
-  if (last.close > previousHigh) return "BULLISH";
-  if (last.close < previousLow) return "BEARISH";
+  if (last.close > previousHigh) {
+    return "BULLISH";
+  }
+
+  if (last.close < previousLow) {
+    return "BEARISH";
+  }
 
   return "NONE";
 }
 
-// ================================================================
+// ===============================
 // CONFIRMATION
-// ================================================================
+// ===============================
 
 function confirmation(candles) {
+  if (candles.length < 5) {
+    return "WEAK";
+  }
+
   const c = candles[candles.length - 2];
   const avg = averageBody(candles);
 
@@ -514,12 +597,14 @@ function confirmation(candles) {
   return "WEAK";
 }
 
-// ================================================================
-// SIGNAL ENGINE
-// ================================================================
+// ===============================
+// SMC ANALYSIS
+// ===============================
 
 function analyze(symbol, candles) {
-  if (candles.length < 20) return null;
+  if (candles.length < 20) {
+    return null;
+  }
 
   const trend = getTrend(candles);
   const fvg = detectFVG(candles);
@@ -530,55 +615,95 @@ function analyze(symbol, candles) {
   let buy = 0;
   let sell = 0;
 
-  if (trend === "BULLISH") buy += 2;
-  if (trend === "BEARISH") sell += 2;
+  // Trend
+  if (trend === "BULLISH") {
+    buy += 2;
+  }
 
-  if (fvg?.type === "BULLISH") buy += 2;
-  if (fvg?.type === "BEARISH") sell += 2;
+  if (trend === "BEARISH") {
+    sell += 2;
+  }
 
-  if (ob?.type === "BULLISH") buy += 2;
-  if (ob?.type === "BEARISH") sell += 2;
+  // FVG
+  if (fvg?.type === "BULLISH") {
+    buy += 2;
+  }
 
-  if (liquidity === "BULLISH") buy += 1;
-  if (liquidity === "BEARISH") sell += 1;
+  if (fvg?.type === "BEARISH") {
+    sell += 2;
+  }
 
-  if (confirm === "BULLISH") buy += 2;
-  if (confirm === "BEARISH") sell += 2;
+  // Order Block
+  if (ob?.type === "BULLISH") {
+    buy += 2;
+  }
+
+  if (ob?.type === "BEARISH") {
+    sell += 2;
+  }
+
+  // Liquidity
+  if (liquidity === "BULLISH") {
+    buy += 1;
+  }
+
+  if (liquidity === "BEARISH") {
+    sell += 1;
+  }
+
+  // Confirmation
+  if (confirm === "BULLISH") {
+    buy += 2;
+  }
+
+  if (confirm === "BEARISH") {
+    sell += 2;
+  }
 
   const score = Math.max(buy, sell);
 
-  if (score < 7) return null;
+  // Not strong enough
+  if (score < 7) {
+    return null;
+  }
 
   let direction;
 
-  if (buy > sell) direction = "BUY";
-  else if (sell > buy) direction = "SELL";
-  else return null;
+  if (buy > sell) {
+    direction = "BUY";
+  } else if (sell > buy) {
+    direction = "SELL";
+  } else {
+    return null;
+  }
 
-  const confidence = Math.min(
-    95,
-    55 + score * 5
-  );
+  const confidence = Math.min(95, 55 + score * 5);
 
-  if (confidence < MIN_CONFIDENCE) return null;
+  if (confidence < MIN_CONFIDENCE) {
+    return null;
+  }
+
+  const latestCandle = candles[candles.length - 1];
 
   return {
     symbol,
     direction,
     confidence,
+    score,
     trend,
     fvg: fvg?.type || "NONE",
     orderBlock: ob?.type || "NONE",
     liquidity,
     confirmation: confirm,
-    entry: candles[candles.length - 1].close,
+    entry: latestCandle.close,
+    candleTime: latestCandle.time,
     createdAt: Date.now()
   };
 }
 
-// ================================================================
+// ===============================
 // SIGNAL MESSAGE
-// ================================================================
+// ===============================
 
 function signalMessage(signal) {
   const now = new Intl.DateTimeFormat("en-US", {
@@ -594,8 +719,7 @@ function signalMessage(signal) {
       ? "🟢 BUY"
       : "🔴 SELL";
 
-  return `
-🚨 BINARY SIGNAL 🚨
+  return `🚨 BINARY SIGNAL 🚨
 
 ⏱ Trade Time: ${now}
 
@@ -608,12 +732,23 @@ function signalMessage(signal) {
 📈 SIGNAL RULES
 
 💵 Risk: ${RISK_PERCENT}% of Capital
-`;
+
+🧠 CONFIRMATION
+
+📈 Trend: ${signal.trend}
+💎 FVG: ${signal.fvg}
+📦 Order Block: ${signal.orderBlock}
+💧 Liquidity: ${signal.liquidity}
+🕯 Confirmation: ${signal.confirmation}
+
+🔄 Continuous scanning
+
+⚠️ Confidence is a strategy score, not a guaranteed win probability.`;
 }
 
-// ================================================================
+// ===============================
 // SEND SIGNAL
-// ================================================================
+// ===============================
 
 async function sendSignal(chatId, signal) {
   const id =
@@ -628,27 +763,54 @@ async function sendSignal(chatId, signal) {
       EXPIRY_MINUTES * 60 * 1000
   });
 
+  lastSignalCandle.set(
+    `${chatId}_${signal.symbol}`,
+    signal.candleTime
+  );
+
   await bot.sendMessage(
     chatId,
     signalMessage(signal)
   );
 }
 
-// ================================================================
+// ===============================
 // FIND BEST SIGNAL
-// ================================================================
+// ===============================
 
-async function findBestSignal() {
+async function findBestSignal(chatId = null) {
   const found = [];
 
   for (const pair of PAIRS) {
     try {
       const candles = await getCandles(pair);
-      const signal = analyze(pair, candles);
 
-      if (signal) {
-        found.push(signal);
+      const signal = analyze(
+        pair,
+        candles
+      );
+
+      if (!signal) {
+        continue;
       }
+
+      // Prevent the exact same setup/candle
+      // from being sent repeatedly.
+      if (chatId !== null) {
+        const key = `${chatId}_${pair}`;
+        const previousCandle =
+          lastSignalCandle.get(key);
+
+        if (
+          previousCandle &&
+          previousCandle === signal.candleTime
+        ) {
+          continue;
+        }
+      }
+
+      found.push(signal);
+
     } catch (error) {
       console.error(
         `❌ ${pair}: ${error.message}`
@@ -656,31 +818,32 @@ async function findBestSignal() {
     }
   }
 
-  if (!found.length) return null;
+  if (!found.length) {
+    return null;
+  }
 
+  // Strongest confidence first
   found.sort(
-    (a, b) => b.confidence - a.confidence
+    (a, b) =>
+      b.confidence - a.confidence
   );
 
   return found[0];
 }
 
-// ================================================================
+// ===============================
 // MANUAL SIGNAL
-// ================================================================
+// ===============================
 
 async function sendBestSignal(chatId) {
   if (currentSessionState() !== "ACTIVE") {
     await bot.sendMessage(
       chatId,
-      `
-💤 SIGNAL SESSION IS OFF
+      `💤 SIGNAL SESSION IS OFF
 
-⏰ Current session is on break.
+⏰ The bot is currently in its 8:00 PM – 9:00 PM Nigeria break.
 
-🚀 Next session:
-9:00 PM WAT
-`
+🟢 New signals resume at 9:00 PM.`
     );
 
     return;
@@ -688,149 +851,203 @@ async function sendBestSignal(chatId) {
 
   await bot.sendMessage(
     chatId,
-    "🔎 Scanning all pairs for confirmation..."
+    "🔎 Scanning all configured pairs for the strongest confirmed setup..."
   );
 
-  const signal = await findBestSignal();
+  const signal =
+    await findBestSignal(chatId);
 
   if (!signal) {
     await bot.sendMessage(
       chatId,
-      `
-⏳ NO HIGH-QUALITY SIGNAL
+      `⏳ NO HIGH-QUALITY SIGNAL
 
-🔎 All configured pairs checked.
+The engine did not find a sufficiently strong confirmed setup.
 
-🛡️ No confirmed setup found.
-
-Wait for the next market opportunity.
-`
+🔄 It will continue scanning.`
     );
 
     return;
   }
 
-  await sendSignal(chatId, signal);
+  await sendSignal(
+    chatId,
+    signal
+  );
 }
 
-// ================================================================
-// AUTOMATIC SIGNAL ENGINE
-// ================================================================
+// ===============================
+// AUTOMATIC SCANNER
+// ===============================
 
 async function automaticScanner() {
-  if (currentSessionState() !== "ACTIVE") {
+  if (
+    currentSessionState() !==
+    "ACTIVE"
+  ) {
     return;
   }
 
-  // Only one unresolved signal at a time per user.
   for (const chatId of users) {
-    const hasActive = [...activeSignals.values()]
-      .some(s => s.chatId === chatId);
+    // One active signal at a time
+    const hasActiveSignal =
+      [...activeSignals.values()]
+        .some(
+          (signal) =>
+            signal.chatId === chatId
+        );
 
-    if (hasActive) continue;
+    if (hasActiveSignal) {
+      continue;
+    }
 
     try {
-      const signal = await findBestSignal();
+      const signal =
+        await findBestSignal(chatId);
 
-      if (!signal) continue;
+      if (!signal) {
+        continue;
+      }
 
-      await sendSignal(chatId, signal);
+      await sendSignal(
+        chatId,
+        signal
+      );
 
       console.log(
-        `🚨 SIGNAL ${signal.symbol} ${signal.direction} ${signal.confidence}%`
+        `🚨 SIGNAL ${signal.symbol} ${signal.direction} ${signal.confidence}% → ${chatId}`
       );
 
     } catch (error) {
       console.error(
-        "Scanner error:",
+        "❌ Scanner error:",
         error.message
       );
     }
   }
 }
 
-// ================================================================
-// RESULT CHECKER
-// ================================================================
+// ===============================
+// CHECK 1M RESULTS
+// ===============================
 
 async function checkResults() {
   const now = Date.now();
 
   for (const [id, signal] of activeSignals) {
-    if (now < signal.expiryAt) continue;
+    if (now < signal.expiryAt) {
+      continue;
+    }
 
     try {
       const candles =
-        await getCandles(signal.symbol);
+        await getCandles(
+          signal.symbol
+        );
 
       const last =
         candles[candles.length - 1];
 
       const entry = signal.entry;
-      const finalPrice = last.close;
+      const finalPrice =
+        last.close;
 
       let win = false;
 
-      if (signal.direction === "BUY") {
-        win = finalPrice > entry;
+      if (
+        signal.direction ===
+        "BUY"
+      ) {
+        win =
+          finalPrice > entry;
       }
 
-      if (signal.direction === "SELL") {
-        win = finalPrice < entry;
+      if (
+        signal.direction ===
+        "SELL"
+      ) {
+        win =
+          finalPrice < entry;
       }
+
+      // ===========================
+      // UPDATE STATS
+      // ===========================
 
       dailyStats.trades++;
 
-      if (!dailyStats.pairs[signal.symbol]) {
-        dailyStats.pairs[signal.symbol] = {
+      if (
+        !dailyStats.pairs[
+          signal.symbol
+        ]
+      ) {
+        dailyStats.pairs[
+          signal.symbol
+        ] = {
           wins: 0,
           losses: 0
         };
       }
 
+      // ===========================
+      // WIN
+      // ===========================
+
       if (win) {
         dailyStats.wins++;
-        dailyStats.pairs[signal.symbol].wins++;
+
+        dailyStats.pairs[
+          signal.symbol
+        ].wins++;
 
         await bot.sendMessage(
           signal.chatId,
-          `
-🏆 RESULT
+          `🏆 RESULT: WIN 🟢
 
 💱 ${signal.symbol}
-${signal.direction === "BUY" ? "🟢 BUY" : "🔴 SELL"}
 
-✅ WIN
+📈 Direction: ${signal.direction}
 
-━━━━━━━━━━━━━━━━━━━━
-📊 Confidence: ${signal.confidence}%
 ⌛ Expiry: 1M
-━━━━━━━━━━━━━━━━━━━━
 
-🔎 Scanning for the next setup...
-`
+💰 Entry: ${entry}
+
+💰 Result: ${finalPrice}
+
+🏆 WIN
+
+🔄 Scanning all pairs again for the next confirmed setup...`
         );
-      } else {
+      }
+
+      // ===========================
+      // LOSS
+      // ===========================
+
+      else {
         dailyStats.losses++;
-        dailyStats.pairs[signal.symbol].losses++;
+
+        dailyStats.pairs[
+          signal.symbol
+        ].losses++;
 
         await bot.sendMessage(
           signal.chatId,
-          `
-❌ RESULT
+          `❌ RESULT: LOSS 🔴
 
 💱 ${signal.symbol}
-${signal.direction === "BUY" ? "🟢 BUY" : "🔴 SELL"}
 
-🔴 LOSS
+📉 Direction: ${signal.direction}
 
-━━━━━━━━━━━━━━━━━━━━
-📊 Confidence: ${signal.confidence}%
 ⌛ Expiry: 1M
-━━━━━━━━━━━━━━━━━━━━
 
-🔎 Scanning for the next setup...
-`
+💰 Entry: ${entry}
+
+💰 Result: ${finalPrice}
+
+❌ LOSS
+
+🔄 Scanning all pairs again for the next confirmed setup...`
         );
       }
 
@@ -838,100 +1055,91 @@ ${signal.direction === "BUY" ? "🟢 BUY" : "🔴 SELL"}
 
     } catch (error) {
       console.error(
-        "Result error:",
+        "❌ Result error:",
         error.message
       );
 
-      // Don't silently call an unresolved trade a WIN/LOSS.
       activeSignals.delete(id);
     }
   }
 }
 
-// ================================================================
+// ===============================
 // DAILY REPORT
-// ================================================================
+// ===============================
 
 async function sendDailyReport(chatId) {
-  const total = dailyStats.trades;
+  const total =
+    dailyStats.trades;
 
   const winRate =
     total === 0
-      ? 0
-      : ((dailyStats.wins / total) * 100).toFixed(2);
+      ? "0.00"
+      : (
+          (dailyStats.wins /
+            total) *
+          100
+        ).toFixed(2);
 
   const pairLines =
-    Object.entries(dailyStats.pairs)
-      .map(([pair, s]) =>
-        `💱 ${pair}: ${s.wins}W / ${s.losses}L`
+    Object.entries(
+      dailyStats.pairs
+    )
+      .map(
+        ([pair, stats]) =>
+          `💱 ${pair}: ${stats.wins}W / ${stats.losses}L`
       )
-      .join("\n") || "No completed trades.";
-
-  const date = nigeriaDate();
+      .join("\n") ||
+    "No completed trades.";
 
   await bot.sendMessage(
     chatId,
-    `
-╔══════════════════════════╗
-       📊 DAILY RESULTS
-╚══════════════════════════╝
+    `📊 DAILY SIGNAL REPORT
 
-📅 ${date}
-⏰ 8:00 PM WAT
+📅 Date: ${nigeriaDate()}
 
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━
 
-📌 ALL TRADES
-${dailyStats.trades}
+🏁 Total Trades: ${total}
 
-🏆 WINS
-${dailyStats.wins}
+🏆 Wins: ${dailyStats.wins}
 
-❌ LOSSES
-${dailyStats.losses}
+❌ Losses: ${dailyStats.losses}
 
-📈 WIN RATE
-${winRate}%
+📈 Win Rate: ${winRate}%
 
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━
 
-💱 PAIR BREAKDOWN
+💱 PAIR PERFORMANCE
 
 ${pairLines}
 
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━
 
-💵 RISK SETTING
+💵 Risk Setting:
 ${RISK_PERCENT}% of Capital
 
-⚠️ P/L is not calculated as
-broker payout here because
-payout rates differ by broker
-and asset.
+⚠️ Monetary P/L is not calculated because the bot does not have access to your Pocket Option account balance or actual payout.
 
-━━━━━━━━━━━━━━━━━━━━
+🔴 Trading session closed.
 
-💤 SESSION CLOSED
-
-🚀 NEXT SESSION
-9:00 PM WAT
-
-━━━━━━━━━━━━━━━━━━━━
-`
+⏰ Next session:
+9:00 PM Nigeria time.`
   );
 }
 
-// ================================================================
-// 8 PM DAILY REPORT
-// ================================================================
-
-let lastReportDate = null;
+// ===============================
+// DAILY SCHEDULE
+// ===============================
 
 async function dailySchedule() {
-  const t = nigeriaTimeParts();
-  const today = nigeriaDate();
+  const t =
+    nigeriaTimeParts();
 
-  // Report once at 8:00 PM
+  const today =
+    nigeriaDate();
+
+  // Exactly 8:00 PM
   if (
     t.hour === 20 &&
     t.minute === 0 &&
@@ -939,32 +1147,33 @@ async function dailySchedule() {
   ) {
     lastReportDate = today;
 
+    // Stop active signals
+    activeSignals.clear();
+
     for (const chatId of users) {
       try {
-        await sendDailyReport(chatId);
+        await sendDailyReport(
+          chatId
+        );
       } catch (error) {
         console.error(
-          "Report error:",
+          "❌ Report error:",
           error.message
         );
       }
     }
 
-    // Clear active signals.
-    activeSignals.clear();
-
-    // Reset after report.
     resetDailyStats();
 
     console.log(
-      "📊 Daily report sent. Session closed."
+      "📊 Daily report sent. Trading session closed."
     );
   }
 }
 
-// ================================================================
-// SCHEDULE LOOPS
-// ================================================================
+// ===============================
+// START LOOPS
+// ===============================
 
 setInterval(
   automaticScanner,
@@ -981,27 +1190,37 @@ setInterval(
   1000
 );
 
-// ================================================================
-// START
-// ================================================================
+// ===============================
+// START MESSAGE
+// ===============================
 
-console.log(`
-🚀 BINARY SIGNAL PRO STARTED
+console.log(
+  "🚀 BINARY SIGNAL PRO STARTED"
+);
 
-⏱ Analysis: ${ANALYSIS_TIMEFRAME}
-⌛ Expiry: ${EXPIRY_MINUTES}M
+console.log(
+  "📊 Analysis:",
+  ANALYSIS_TIMEFRAME
+);
 
-🕘 ACTIVE:
-9:00 PM → 8:00 PM
+console.log(
+  "⌛ Expiry:",
+  `${EXPIRY_MINUTES}M`
+);
 
-💤 BREAK:
-8:00 PM → 9:00 PM
+console.log(
+  "💱 Pairs:",
+  PAIRS.length
+);
 
-📊 DAILY REPORT:
-8:00 PM WAT
+console.log(
+  "🔄 Continuous scanning: ON"
+);
 
-💱 PAIRS:
-${PAIRS.join(", ")}
+console.log(
+  "🌐 Public users: ENABLED"
+);
 
-🛡️ SIGNAL ONLY
-`);
+console.log(
+  "🚫 Custom menu buttons: REMOVED"
+);
