@@ -9,23 +9,31 @@ const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY;
 
 const TIMEZONE = "Africa/Lagos";
 
-// ===============================
+// =====================================================
 // SETTINGS
-// ===============================
+// =====================================================
 
-const ANALYSIS_TIMEFRAME = "5min";
+// CHANGED FROM 5min TO 1min
+const ANALYSIS_TIMEFRAME = "1min";
+
+// 1-minute binary expiry
 const EXPIRY_MINUTES = 1;
 
-// Scan every 60 seconds to reduce API usage.
+// Scan every 60 seconds
 const SCAN_INTERVAL = 60 * 1000;
+
+// Check finished signals every 10 seconds
 const RESULT_CHECK_INTERVAL = 10 * 1000;
 
+// Minimum strategy score
 const MIN_CONFIDENCE = 76;
+
+// Requested risk display
 const RISK_PERCENT = 5;
 
-// ===============================
+// =====================================================
 // PAIRS
-// ===============================
+// =====================================================
 
 const PAIRS = [
   "EUR/USD",
@@ -40,9 +48,9 @@ const PAIRS = [
   "GBP/JPY"
 ];
 
-// ===============================
-// BASIC CHECKS
-// ===============================
+// =====================================================
+// CHECK ENVIRONMENT
+// =====================================================
 
 if (!BOT_TOKEN) {
   console.error("❌ BOT_TOKEN is missing");
@@ -54,22 +62,27 @@ if (!TWELVE_DATA_API_KEY) {
   process.exit(1);
 }
 
-// ===============================
-// TELEGRAM
-// ===============================
+// =====================================================
+// TELEGRAM BOT
+// =====================================================
 
 const bot = new TelegramBot(BOT_TOKEN, {
   polling: true
 });
 
-// Users who have started the bot.
-// Anyone can use the bot by sending /start.
+// Anyone who sends /start is registered
 const users = new Set();
 
 // Active signals
 const activeSignals = new Map();
 
-// Daily statistics
+// Prevent sending the same setup repeatedly
+const lastSignalCandle = new Map();
+
+// =====================================================
+// DAILY STATISTICS
+// =====================================================
+
 const dailyStats = {
   trades: 0,
   wins: 0,
@@ -81,12 +94,9 @@ const dailyStats = {
 
 let lastReportDate = null;
 
-// Prevent duplicate signals on the same setup/candle
-const lastSignalCandle = new Map();
-
-// ===============================
+// =====================================================
 // WEB SERVER
-// ===============================
+// =====================================================
 
 app.get("/", (req, res) => {
   res.send("🚨 Binary Signal Pro is running");
@@ -108,9 +118,9 @@ app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
 
-// ===============================
-// TIME
-// ===============================
+// =====================================================
+// NIGERIA TIME
+// =====================================================
 
 function nigeriaTimeParts() {
   const parts = new Intl.DateTimeFormat("en-GB", {
@@ -145,31 +155,46 @@ function nigeriaDate() {
   }).format(new Date());
 }
 
-// ===============================
-// SESSION
-// ===============================
+function formatNigeriaTime() {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: TIMEZONE,
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true
+  }).format(new Date());
+}
+
+// =====================================================
+// TRADING SESSION
+// =====================================================
 //
 // ACTIVE:
-// 9:00 PM → 8:00 PM next day
+// 9:00 PM → 8:00 PM
 //
 // BREAK:
 // 8:00 PM → 9:00 PM
-// ===============================
+// =====================================================
 
 function currentSessionState() {
   const t = nigeriaTimeParts();
-  const minutes = t.hour * 60 + t.minute;
 
-  if (minutes >= 21 * 60 || minutes < 20 * 60) {
+  const minutes =
+    t.hour * 60 + t.minute;
+
+  if (
+    minutes >= 21 * 60 ||
+    minutes < 20 * 60
+  ) {
     return "ACTIVE";
   }
 
   return "BREAK";
 }
 
-// ===============================
-// DAILY RESET
-// ===============================
+// =====================================================
+// RESET DAILY STATS
+// =====================================================
 
 function resetDailyStats() {
   dailyStats.trades = 0;
@@ -182,23 +207,25 @@ function resetDailyStats() {
   lastSignalCandle.clear();
 }
 
-// ===============================
+// =====================================================
 // /START
-// ===============================
+// =====================================================
 //
-// NO MENU BUTTONS.
-// EVERY USER CAN START THE BOT.
-// ===============================
+// NO MENU BUTTONS
+// PUBLIC BOT
+// =====================================================
 
 bot.onText(/^\/start$/, async (msg) => {
   const chatId = msg.chat.id;
 
-  // Register user
   users.add(chatId);
 
-  console.log(`👤 User registered: ${chatId}`);
+  console.log(
+    `👤 User registered: ${chatId}`
+  );
 
-  const session = currentSessionState();
+  const session =
+    currentSessionState();
 
   let message = `
 🚨 BINARY SIGNAL PRO 🚨
@@ -206,7 +233,7 @@ bot.onText(/^\/start$/, async (msg) => {
 Welcome to the signal engine.
 
 🧠 SMC ANALYSIS
-📊 5M TIMEFRAME
+📊 1M TIMEFRAME
 ⌛ 1M EXPIRY
 🔄 CONTINUOUS SCANNING
 
@@ -221,9 +248,9 @@ The engine checks:
 Only sufficiently strong setups can become signals.
 
 🏆 WIN / ❌ LOSS
-After every completed trade, the engine scans again.
 
-⚠️ Signals are not guaranteed profits.
+After every completed trade,
+the engine scans again.
 `;
 
   if (session === "ACTIVE") {
@@ -232,7 +259,6 @@ After every completed trade, the engine scans again.
 
 🔎 The engine is scanning for the strongest confirmed setup.
 `;
-
   } else {
     message += `
 💤 STATUS: BREAK
@@ -241,12 +267,15 @@ After every completed trade, the engine scans again.
 `;
   }
 
-  await bot.sendMessage(chatId, message);
+  await bot.sendMessage(
+    chatId,
+    message
+  );
 });
 
-// ===============================
-// OPTIONAL COMMANDS
-// ===============================
+// =====================================================
+// MANUAL /SIGNAL
+// =====================================================
 
 bot.onText(/^\/signal$/, async (msg) => {
   const chatId = msg.chat.id;
@@ -256,62 +285,93 @@ bot.onText(/^\/signal$/, async (msg) => {
   await sendBestSignal(chatId);
 });
 
+// =====================================================
+// /MARKET
+// =====================================================
+
 bot.onText(/^\/market$/, async (msg) => {
   const chatId = msg.chat.id;
 
   users.add(chatId);
 
-  const session = currentSessionState();
+  const session =
+    currentSessionState();
 
   await bot.sendMessage(
     chatId,
     `📊 MARKET STATUS
 
-🕐 Nigeria Time: ${formatNigeriaTime()}
+🕐 Nigeria Time:
+${formatNigeriaTime()}
 
-📡 Session: ${
-      session === "ACTIVE" ? "🟢 ACTIVE" : "💤 BREAK"
-    }
+📡 Session:
+${
+  session === "ACTIVE"
+    ? "🟢 ACTIVE"
+    : "💤 BREAK"
+}
 
-📊 Analysis: ${ANALYSIS_TIMEFRAME.toUpperCase()}
+📊 Analysis:
+${ANALYSIS_TIMEFRAME.toUpperCase()}
 
-⌛ Expiry: ${EXPIRY_MINUTES}M
+⌛ Expiry:
+${EXPIRY_MINUTES}M
 
-💱 Configured Pairs: ${PAIRS.length}
+💱 Configured Pairs:
+${PAIRS.length}
 
-🔄 Continuous Scanning: ON`
+🔄 Continuous Scanning:
+ON`
   );
 });
+
+// =====================================================
+// /RESULTS
+// =====================================================
 
 bot.onText(/^\/results$/, async (msg) => {
   const chatId = msg.chat.id;
 
   users.add(chatId);
 
-  const total = dailyStats.trades;
+  const total =
+    dailyStats.trades;
 
   const winRate =
     total === 0
-      ? 0
-      : ((dailyStats.wins / total) * 100).toFixed(2);
+      ? "0.00"
+      : (
+          (dailyStats.wins /
+            total) *
+          100
+        ).toFixed(2);
 
   await bot.sendMessage(
     chatId,
     `📊 TODAY'S RESULTS
 
-🏁 Trades: ${total}
+🏁 Trades:
+${total}
 
-🏆 Wins: ${dailyStats.wins}
+🏆 Wins:
+${dailyStats.wins}
 
-❌ Losses: ${dailyStats.losses}
+❌ Losses:
+${dailyStats.losses}
 
-📈 Win Rate: ${winRate}%
+📈 Win Rate:
+${winRate}%
 
-💵 Risk Setting: ${RISK_PERCENT}% of Capital
+💵 Risk Setting:
+${RISK_PERCENT}% of Capital
 
 ⚠️ Monetary profit/loss is not calculated because the bot does not have access to your Pocket Option balance or payout.`
   );
 });
+
+// =====================================================
+// /PAIRS
+// =====================================================
 
 bot.onText(/^\/pairs$/, async (msg) => {
   const chatId = msg.chat.id;
@@ -322,11 +382,18 @@ bot.onText(/^\/pairs$/, async (msg) => {
     chatId,
     `💱 CONFIGURED PAIRS
 
-${PAIRS.map((pair, i) => `${i + 1}. ${pair}`).join("\n")}
+${PAIRS.map(
+  (pair, i) =>
+    `${i + 1}. ${pair}`
+).join("\n")}
 
 🔎 The engine scans all configured pairs and selects the strongest confirmed setup.`
   );
 });
+
+// =====================================================
+// /HELP
+// =====================================================
 
 bot.onText(/^\/help$/, async (msg) => {
   const chatId = msg.chat.id;
@@ -346,27 +413,16 @@ Commands:
 /pairs — Configured pairs
 /help — Help
 
-🔄 The automatic engine continuously scans while the trading session is active.`
+📊 Analysis: 1M
+⌛ Expiry: 1M
+
+🔄 Automatic scanning remains ON while the trading session is active.`
   );
 });
 
-// ===============================
-// TIME FORMAT
-// ===============================
-
-function formatNigeriaTime() {
-  return new Intl.DateTimeFormat("en-US", {
-    timeZone: TIMEZONE,
-    hour: "numeric",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: true
-  }).format(new Date());
-}
-
-// ===============================
-// TWELVE DATA
-// ===============================
+// =====================================================
+// TWELVE DATA CANDLES
+// =====================================================
 
 async function getCandles(symbol) {
   const url =
@@ -377,20 +433,29 @@ async function getCandles(symbol) {
     `&timezone=UTC` +
     `&apikey=${TWELVE_DATA_API_KEY}`;
 
-  const response = await fetch(url);
+  const response =
+    await fetch(url);
 
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
+    throw new Error(
+      `HTTP ${response.status}`
+    );
   }
 
-  const data = await response.json();
+  const data =
+    await response.json();
 
   if (data.status === "error") {
-    throw new Error(data.message || "Twelve Data error");
+    throw new Error(
+      data.message ||
+        "Twelve Data error"
+    );
   }
 
   if (!Array.isArray(data.values)) {
-    throw new Error("No candle data");
+    throw new Error(
+      "No candle data"
+    );
   }
 
   return data.values
@@ -404,9 +469,9 @@ async function getCandles(symbol) {
     .reverse();
 }
 
-// ===============================
-// CANDLE FUNCTIONS
-// ===============================
+// =====================================================
+// CANDLE HELPERS
+// =====================================================
 
 function bullish(c) {
   return c.close > c.open;
@@ -417,38 +482,58 @@ function bearish(c) {
 }
 
 function body(c) {
-  return Math.abs(c.close - c.open);
+  return Math.abs(
+    c.close - c.open
+  );
 }
 
-function averageBody(candles, count = 10) {
-  const data = candles.slice(-count);
+function averageBody(
+  candles,
+  count = 10
+) {
+  const data =
+    candles.slice(-count);
 
   if (!data.length) {
     return 0;
   }
 
   return (
-    data.reduce((sum, c) => sum + body(c), 0) /
-    data.length
+    data.reduce(
+      (sum, c) =>
+        sum + body(c),
+      0
+    ) / data.length
   );
 }
 
-// ===============================
+// =====================================================
 // TREND
-// ===============================
+// =====================================================
 
 function getTrend(candles) {
-  const recent = candles.slice(-15);
+  const recent =
+    candles.slice(-15);
 
   let up = 0;
   let down = 0;
 
-  for (let i = 1; i < recent.length; i++) {
-    if (recent[i].close > recent[i - 1].close) {
+  for (
+    let i = 1;
+    i < recent.length;
+    i++
+  ) {
+    if (
+      recent[i].close >
+      recent[i - 1].close
+    ) {
       up++;
     }
 
-    if (recent[i].close < recent[i - 1].close) {
+    if (
+      recent[i].close <
+      recent[i - 1].close
+    ) {
       down++;
     }
   }
@@ -464,17 +549,20 @@ function getTrend(candles) {
   return "NEUTRAL";
 }
 
-// ===============================
+// =====================================================
 // FAIR VALUE GAP
-// ===============================
+// =====================================================
 
 function detectFVG(candles) {
   if (candles.length < 5) {
     return null;
   }
 
-  const a = candles[candles.length - 4];
-  const c = candles[candles.length - 2];
+  const a =
+    candles[candles.length - 4];
+
+  const c =
+    candles[candles.length - 2];
 
   // Bullish FVG
   if (c.low > a.high) {
@@ -497,25 +585,30 @@ function detectFVG(candles) {
   return null;
 }
 
-// ===============================
+// =====================================================
 // ORDER BLOCK
-// ===============================
+// =====================================================
 
 function detectOrderBlock(candles) {
   if (candles.length < 6) {
     return null;
   }
 
-  const previous = candles[candles.length - 3];
-  const impulse = candles[candles.length - 2];
+  const previous =
+    candles[candles.length - 3];
 
-  const avg = averageBody(candles);
+  const impulse =
+    candles[candles.length - 2];
 
-  // Bullish OB
+  const avg =
+    averageBody(candles);
+
+  // Bullish Order Block
   if (
     bearish(previous) &&
     bullish(impulse) &&
-    body(impulse) >= avg * 1.25
+    body(impulse) >=
+      avg * 1.25
   ) {
     return {
       type: "BULLISH",
@@ -524,11 +617,12 @@ function detectOrderBlock(candles) {
     };
   }
 
-  // Bearish OB
+  // Bearish Order Block
   if (
     bullish(previous) &&
     bearish(impulse) &&
-    body(impulse) >= avg * 1.25
+    body(impulse) >=
+      avg * 1.25
   ) {
     return {
       type: "BEARISH",
@@ -540,129 +634,201 @@ function detectOrderBlock(candles) {
   return null;
 }
 
-// ===============================
+// =====================================================
 // LIQUIDITY
-// ===============================
+// =====================================================
 
 function liquidityDirection(candles) {
-  const recent = candles.slice(-8);
+  const recent =
+    candles.slice(-8);
 
   if (recent.length < 3) {
     return "NONE";
   }
 
-  const highs = recent.map((c) => c.high);
-  const lows = recent.map((c) => c.low);
+  const highs =
+    recent.map(
+      (c) => c.high
+    );
 
-  const last = recent[recent.length - 1];
+  const lows =
+    recent.map(
+      (c) => c.low
+    );
 
-  const previousHigh = Math.max(...highs.slice(0, -1));
-  const previousLow = Math.min(...lows.slice(0, -1));
+  const last =
+    recent[recent.length - 1];
 
-  if (last.close > previousHigh) {
+  const previousHigh =
+    Math.max(
+      ...highs.slice(0, -1)
+    );
+
+  const previousLow =
+    Math.min(
+      ...lows.slice(0, -1)
+    );
+
+  if (
+    last.close >
+    previousHigh
+  ) {
     return "BULLISH";
   }
 
-  if (last.close < previousLow) {
+  if (
+    last.close <
+    previousLow
+  ) {
     return "BEARISH";
   }
 
   return "NONE";
 }
 
-// ===============================
+// =====================================================
 // CONFIRMATION
-// ===============================
+// =====================================================
 
 function confirmation(candles) {
   if (candles.length < 5) {
     return "WEAK";
   }
 
-  const c = candles[candles.length - 2];
-  const avg = averageBody(candles);
+  // Use last completed candle
+  const c =
+    candles[candles.length - 2];
 
-  if (body(c) < avg * 0.8) {
+  const avg =
+    averageBody(candles);
+
+  if (
+    body(c) <
+    avg * 0.8
+  ) {
     return "WEAK";
   }
 
-  if (bullish(c) && body(c) >= avg) {
+  if (
+    bullish(c) &&
+    body(c) >= avg
+  ) {
     return "BULLISH";
   }
 
-  if (bearish(c) && body(c) >= avg) {
+  if (
+    bearish(c) &&
+    body(c) >= avg
+  ) {
     return "BEARISH";
   }
 
   return "WEAK";
 }
 
-// ===============================
+// =====================================================
 // SMC ANALYSIS
-// ===============================
+// =====================================================
 
-function analyze(symbol, candles) {
+function analyze(
+  symbol,
+  candles
+) {
   if (candles.length < 20) {
     return null;
   }
 
-  const trend = getTrend(candles);
-  const fvg = detectFVG(candles);
-  const ob = detectOrderBlock(candles);
-  const liquidity = liquidityDirection(candles);
-  const confirm = confirmation(candles);
+  const trend =
+    getTrend(candles);
+
+  const fvg =
+    detectFVG(candles);
+
+  const ob =
+    detectOrderBlock(candles);
+
+  const liquidity =
+    liquidityDirection(
+      candles
+    );
+
+  const confirm =
+    confirmation(candles);
 
   let buy = 0;
   let sell = 0;
 
   // Trend
-  if (trend === "BULLISH") {
+  if (
+    trend === "BULLISH"
+  ) {
     buy += 2;
   }
 
-  if (trend === "BEARISH") {
+  if (
+    trend === "BEARISH"
+  ) {
     sell += 2;
   }
 
   // FVG
-  if (fvg?.type === "BULLISH") {
+  if (
+    fvg?.type === "BULLISH"
+  ) {
     buy += 2;
   }
 
-  if (fvg?.type === "BEARISH") {
+  if (
+    fvg?.type === "BEARISH"
+  ) {
     sell += 2;
   }
 
   // Order Block
-  if (ob?.type === "BULLISH") {
+  if (
+    ob?.type === "BULLISH"
+  ) {
     buy += 2;
   }
 
-  if (ob?.type === "BEARISH") {
+  if (
+    ob?.type === "BEARISH"
+  ) {
     sell += 2;
   }
 
   // Liquidity
-  if (liquidity === "BULLISH") {
+  if (
+    liquidity === "BULLISH"
+  ) {
     buy += 1;
   }
 
-  if (liquidity === "BEARISH") {
+  if (
+    liquidity === "BEARISH"
+  ) {
     sell += 1;
   }
 
   // Confirmation
-  if (confirm === "BULLISH") {
+  if (
+    confirm === "BULLISH"
+  ) {
     buy += 2;
   }
 
-  if (confirm === "BEARISH") {
+  if (
+    confirm === "BEARISH"
+  ) {
     sell += 2;
   }
 
-  const score = Math.max(buy, sell);
+  const score =
+    Math.max(
+      buy,
+      sell
+    );
 
-  // Not strong enough
   if (score < 7) {
     return null;
   }
@@ -677,13 +843,24 @@ function analyze(symbol, candles) {
     return null;
   }
 
-  const confidence = Math.min(95, 55 + score * 5);
+  const confidence =
+    Math.min(
+      95,
+      55 + score * 5
+    );
 
-  if (confidence < MIN_CONFIDENCE) {
+  if (
+    confidence <
+    MIN_CONFIDENCE
+  ) {
     return null;
   }
 
-  const latestCandle = candles[candles.length - 1];
+  // Last candle
+  const latestCandle =
+    candles[
+      candles.length - 1
+    ];
 
   return {
     symbol,
@@ -691,31 +868,44 @@ function analyze(symbol, candles) {
     confidence,
     score,
     trend,
-    fvg: fvg?.type || "NONE",
-    orderBlock: ob?.type || "NONE",
+    fvg:
+      fvg?.type ||
+      "NONE",
+    orderBlock:
+      ob?.type ||
+      "NONE",
     liquidity,
-    confirmation: confirm,
-    entry: latestCandle.close,
-    candleTime: latestCandle.time,
-    createdAt: Date.now()
+    confirmation:
+      confirm,
+    entry:
+      latestCandle.close,
+    candleTime:
+      latestCandle.time,
+    createdAt:
+      Date.now()
   };
 }
 
-// ===============================
+// =====================================================
 // SIGNAL MESSAGE
-// ===============================
+// =====================================================
 
 function signalMessage(signal) {
-  const now = new Intl.DateTimeFormat("en-US", {
-    timeZone: TIMEZONE,
-    hour: "numeric",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: true
-  }).format(new Date());
+  const now =
+    new Intl.DateTimeFormat(
+      "en-US",
+      {
+        timeZone: TIMEZONE,
+        hour: "numeric",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: true
+      }
+    ).format(new Date());
 
   const arrow =
-    signal.direction === "BUY"
+    signal.direction ===
+    "BUY"
       ? "🟢 BUY"
       : "🔴 SELL";
 
@@ -741,27 +931,36 @@ function signalMessage(signal) {
 💧 Liquidity: ${signal.liquidity}
 🕯 Confirmation: ${signal.confirmation}
 
-🔄 Continuous scanning
+🔄 CONTINUOUS SCANNING
 
-⚠️ Confidence is a strategy score, not a guaranteed win probability.`;
+⚠️ Confidence is a strategy score,
+not a guaranteed win probability.`;
 }
 
-// ===============================
+// =====================================================
 // SEND SIGNAL
-// ===============================
+// =====================================================
 
-async function sendSignal(chatId, signal) {
+async function sendSignal(
+  chatId,
+  signal
+) {
   const id =
     `${chatId}_${signal.symbol}_${Date.now()}`;
 
-  activeSignals.set(id, {
-    ...signal,
-    chatId,
+  activeSignals.set(
     id,
-    expiryAt:
-      Date.now() +
-      EXPIRY_MINUTES * 60 * 1000
-  });
+    {
+      ...signal,
+      chatId,
+      id,
+      expiryAt:
+        Date.now() +
+        EXPIRY_MINUTES *
+          60 *
+          1000
+    }
+  );
 
   lastSignalCandle.set(
     `${chatId}_${signal.symbol}`,
@@ -772,38 +971,52 @@ async function sendSignal(chatId, signal) {
     chatId,
     signalMessage(signal)
   );
+
+  console.log(
+    `📡 SENT ${signal.symbol} ${signal.direction} ${signal.confidence}% → ${chatId}`
+  );
 }
 
-// ===============================
-// FIND BEST SIGNAL
-// ===============================
+// =====================================================
+// FIND STRONGEST SIGNAL
+// =====================================================
 
-async function findBestSignal(chatId = null) {
+async function findBestSignal(
+  chatId = null
+) {
   const found = [];
 
-  for (const pair of PAIRS) {
+  for (
+    const pair of PAIRS
+  ) {
     try {
-      const candles = await getCandles(pair);
+      const candles =
+        await getCandles(pair);
 
-      const signal = analyze(
-        pair,
-        candles
-      );
+      const signal =
+        analyze(
+          pair,
+          candles
+        );
 
       if (!signal) {
         continue;
       }
 
-      // Prevent the exact same setup/candle
-      // from being sent repeatedly.
+      // Prevent duplicate setup
       if (chatId !== null) {
-        const key = `${chatId}_${pair}`;
+        const key =
+          `${chatId}_${pair}`;
+
         const previousCandle =
-          lastSignalCandle.get(key);
+          lastSignalCandle.get(
+            key
+          );
 
         if (
           previousCandle &&
-          previousCandle === signal.candleTime
+          previousCandle ===
+            signal.candleTime
         ) {
           continue;
         }
@@ -822,26 +1035,32 @@ async function findBestSignal(chatId = null) {
     return null;
   }
 
-  // Strongest confidence first
+  // Strongest setup first
   found.sort(
     (a, b) =>
-      b.confidence - a.confidence
+      b.confidence -
+      a.confidence
   );
 
   return found[0];
 }
 
-// ===============================
+// =====================================================
 // MANUAL SIGNAL
-// ===============================
+// =====================================================
 
-async function sendBestSignal(chatId) {
-  if (currentSessionState() !== "ACTIVE") {
+async function sendBestSignal(
+  chatId
+) {
+  if (
+    currentSessionState() !==
+    "ACTIVE"
+  ) {
     await bot.sendMessage(
       chatId,
       `💤 SIGNAL SESSION IS OFF
 
-⏰ The bot is currently in its 8:00 PM – 9:00 PM Nigeria break.
+⏰ The bot is currently in the 8:00 PM – 9:00 PM Nigeria break.
 
 🟢 New signals resume at 9:00 PM.`
     );
@@ -851,11 +1070,13 @@ async function sendBestSignal(chatId) {
 
   await bot.sendMessage(
     chatId,
-    "🔎 Scanning all configured pairs for the strongest confirmed setup..."
+    "🔎 Scanning all configured pairs for the strongest confirmed 1M setup..."
   );
 
   const signal =
-    await findBestSignal(chatId);
+    await findBestSignal(
+      chatId
+    );
 
   if (!signal) {
     await bot.sendMessage(
@@ -876,9 +1097,9 @@ The engine did not find a sufficiently strong confirmed setup.
   );
 }
 
-// ===============================
+// =====================================================
 // AUTOMATIC SCANNER
-// ===============================
+// =====================================================
 
 async function automaticScanner() {
   if (
@@ -888,14 +1109,19 @@ async function automaticScanner() {
     return;
   }
 
-  for (const chatId of users) {
-    // One active signal at a time
+  for (
+    const chatId of users
+  ) {
+    // Only one active signal
+    // per user
     const hasActiveSignal =
-      [...activeSignals.values()]
-        .some(
-          (signal) =>
-            signal.chatId === chatId
-        );
+      [
+        ...activeSignals.values()
+      ].some(
+        (signal) =>
+          signal.chatId ===
+          chatId
+      );
 
     if (hasActiveSignal) {
       continue;
@@ -903,7 +1129,9 @@ async function automaticScanner() {
 
     try {
       const signal =
-        await findBestSignal(chatId);
+        await findBestSignal(
+          chatId
+        );
 
       if (!signal) {
         continue;
@@ -915,7 +1143,7 @@ async function automaticScanner() {
       );
 
       console.log(
-        `🚨 SIGNAL ${signal.symbol} ${signal.direction} ${signal.confidence}% → ${chatId}`
+        `🚨 SIGNAL ${signal.symbol} ${signal.direction} ${signal.confidence}%`
       );
 
     } catch (error) {
@@ -927,15 +1155,22 @@ async function automaticScanner() {
   }
 }
 
-// ===============================
-// CHECK 1M RESULTS
-// ===============================
+// =====================================================
+// CHECK RESULTS
+// =====================================================
 
 async function checkResults() {
-  const now = Date.now();
+  const now =
+    Date.now();
 
-  for (const [id, signal] of activeSignals) {
-    if (now < signal.expiryAt) {
+  for (
+    const [id, signal]
+    of activeSignals
+  ) {
+    if (
+      now <
+      signal.expiryAt
+    ) {
       continue;
     }
 
@@ -946,9 +1181,13 @@ async function checkResults() {
         );
 
       const last =
-        candles[candles.length - 1];
+        candles[
+          candles.length - 1
+        ];
 
-      const entry = signal.entry;
+      const entry =
+        signal.entry;
+
       const finalPrice =
         last.close;
 
@@ -959,7 +1198,8 @@ async function checkResults() {
         "BUY"
       ) {
         win =
-          finalPrice > entry;
+          finalPrice >
+          entry;
       }
 
       if (
@@ -967,12 +1207,13 @@ async function checkResults() {
         "SELL"
       ) {
         win =
-          finalPrice < entry;
+          finalPrice <
+          entry;
       }
 
-      // ===========================
-      // UPDATE STATS
-      // ===========================
+      // ==========================
+      // STATS
+      // ==========================
 
       dailyStats.trades++;
 
@@ -989,9 +1230,9 @@ async function checkResults() {
         };
       }
 
-      // ===========================
+      // ==========================
       // WIN
-      // ===========================
+      // ==========================
 
       if (win) {
         dailyStats.wins++;
@@ -1006,13 +1247,17 @@ async function checkResults() {
 
 💱 ${signal.symbol}
 
-📈 Direction: ${signal.direction}
+📈 Direction:
+${signal.direction}
 
-⌛ Expiry: 1M
+⌛ Expiry:
+1M
 
-💰 Entry: ${entry}
+💰 Entry:
+${entry}
 
-💰 Result: ${finalPrice}
+💰 Result:
+${finalPrice}
 
 🏆 WIN
 
@@ -1020,9 +1265,9 @@ async function checkResults() {
         );
       }
 
-      // ===========================
+      // ==========================
       // LOSS
-      // ===========================
+      // ==========================
 
       else {
         dailyStats.losses++;
@@ -1037,13 +1282,17 @@ async function checkResults() {
 
 💱 ${signal.symbol}
 
-📉 Direction: ${signal.direction}
+📉 Direction:
+${signal.direction}
 
-⌛ Expiry: 1M
+⌛ Expiry:
+1M
 
-💰 Entry: ${entry}
+💰 Entry:
+${entry}
 
-💰 Result: ${finalPrice}
+💰 Result:
+${finalPrice}
 
 ❌ LOSS
 
@@ -1064,11 +1313,13 @@ async function checkResults() {
   }
 }
 
-// ===============================
+// =====================================================
 // DAILY REPORT
-// ===============================
+// =====================================================
 
-async function sendDailyReport(chatId) {
+async function sendDailyReport(
+  chatId
+) {
   const total =
     dailyStats.trades;
 
@@ -1096,17 +1347,22 @@ async function sendDailyReport(chatId) {
     chatId,
     `📊 DAILY SIGNAL REPORT
 
-📅 Date: ${nigeriaDate()}
+📅 Date:
+${nigeriaDate()}
 
 ━━━━━━━━━━━━━━
 
-🏁 Total Trades: ${total}
+🏁 Total Trades:
+${total}
 
-🏆 Wins: ${dailyStats.wins}
+🏆 Wins:
+${dailyStats.wins}
 
-❌ Losses: ${dailyStats.losses}
+❌ Losses:
+${dailyStats.losses}
 
-📈 Win Rate: ${winRate}%
+📈 Win Rate:
+${winRate}%
 
 ━━━━━━━━━━━━━━
 
@@ -1115,6 +1371,12 @@ async function sendDailyReport(chatId) {
 ${pairLines}
 
 ━━━━━━━━━━━━━━
+
+📊 Analysis:
+1M
+
+⌛ Expiry:
+1M
 
 💵 Risk Setting:
 ${RISK_PERCENT}% of Capital
@@ -1128,9 +1390,9 @@ ${RISK_PERCENT}% of Capital
   );
 }
 
-// ===============================
+// =====================================================
 // DAILY SCHEDULE
-// ===============================
+// =====================================================
 
 async function dailySchedule() {
   const t =
@@ -1139,7 +1401,7 @@ async function dailySchedule() {
   const today =
     nigeriaDate();
 
-  // Exactly 8:00 PM
+  // 8:00 PM Nigeria time
   if (
     t.hour === 20 &&
     t.minute === 0 &&
@@ -1150,7 +1412,9 @@ async function dailySchedule() {
     // Stop active signals
     activeSignals.clear();
 
-    for (const chatId of users) {
+    for (
+      const chatId of users
+    ) {
       try {
         await sendDailyReport(
           chatId
@@ -1171,9 +1435,9 @@ async function dailySchedule() {
   }
 }
 
-// ===============================
-// START LOOPS
-// ===============================
+// =====================================================
+// START AUTOMATIC LOOPS
+// =====================================================
 
 setInterval(
   automaticScanner,
@@ -1190,22 +1454,24 @@ setInterval(
   1000
 );
 
-// ===============================
-// START MESSAGE
-// ===============================
+// =====================================================
+// STARTUP LOG
+// =====================================================
 
 console.log(
   "🚀 BINARY SIGNAL PRO STARTED"
 );
 
 console.log(
-  "📊 Analysis:",
-  ANALYSIS_TIMEFRAME
+  "📊 Analysis timeframe: 1min"
 );
 
 console.log(
-  "⌛ Expiry:",
-  `${EXPIRY_MINUTES}M`
+  "⌛ Expiry: 1M"
+);
+
+console.log(
+  "🔄 Scan interval: 60 seconds"
 );
 
 console.log(
@@ -1214,7 +1480,7 @@ console.log(
 );
 
 console.log(
-  "🔄 Continuous scanning: ON"
+  "🧠 SMC confirmation: ON"
 );
 
 console.log(
@@ -1223,4 +1489,8 @@ console.log(
 
 console.log(
   "🚫 Custom menu buttons: REMOVED"
+);
+
+console.log(
+  "🔄 Continuous scanning: ON"
 );
