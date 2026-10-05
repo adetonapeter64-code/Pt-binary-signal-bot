@@ -22,15 +22,19 @@ const bot = new TelegramBot(BOT_TOKEN, {
   polling: true
 });
 
+bot.on("polling_error", (e) => {
+  console.error("Polling error:", e.message);
+});
+
 // ===============================
 // SETTINGS
 // ===============================
 
 const SYMBOL = "XAU/USD";
 const INTERVAL = "5min";
+const CANDLE_MS = 5 * 60 * 1000;
 const CANDLE_LIMIT = 150;
 
-const CHECK_EVERY = 60 * 1000; // 1 minute
 const SIGNAL_COOLDOWN = 30 * 60 * 1000; // 30 minutes
 
 const RR = 2.0;
@@ -38,12 +42,35 @@ const RR = 2.0;
 // Telegram users who started the bot
 const subscribers = new Set();
 
+// Optional: set CHAT_ID in Render > Environment so you stay
+// subscribed after restarts / sleep.
+if (process.env.CHAT_ID) {
+  subscribers.add(Number(process.env.CHAT_ID));
+}
+
 // Prevent duplicate signal
 let lastSignalKey = "";
 let lastSignalTime = 0;
-let lastCheckedCandle = "";
+let lastCheckedCandle = 0;
 
 let engineRunning = true;
+
+// Status shown by the "Signal Status" button
+const status = {
+  lastCheck: 0,
+  lastCandle: 0,
+  lastResult: "Not checked yet",
+  lastError: null,
+  checks: 0,
+  errors: 0
+};
+
+const MAIN_KEYBOARD = {
+  reply_markup: {
+    keyboard: [[{ text: "📡 Signal Status" }]],
+    resize_keyboard: true
+  }
+};
 
 // ===============================
 // EXPRESS SERVER
@@ -66,6 +93,8 @@ app.get("/health", (req, res) => {
     symbol: SYMBOL,
     timeframe: INTERVAL,
     subscribers: subscribers.size,
+    lastCheck: status.lastCheck || null,
+    lastResult: status.lastResult,
     lastSignal: lastSignalKey || null
   });
 });
@@ -99,8 +128,10 @@ The engine will automatically send signals when a valid setup is confirmed.
 🟢 BUY
 🔴 SELL
 
-Engine: ${engineRunning ? "RUNNING 🟢" : "STOPPED 🔴"}`,
-    { parse_mode: "Markdown" }
+Engine: ${engineRunning ? "RUNNING 🟢" : "STOPPED 🔴"}
+
+Tap *📡 Signal Status* below to check the engine anytime.`,
+    { parse_mode: "Markdown", ...MAIN_KEYBOARD }
   );
 });
 
@@ -109,7 +140,7 @@ bot.onText(/^\/status$/, async (msg) => {
 
   await bot.sendMessage(
     chatId,
-    `📊 *ENGINE STATUS*
+    `📊 ENGINE STATUS
 
 Engine: ${engineRunning ? "🟢 RUNNING" : "🔴 STOPPED"}
 Symbol: ${SYMBOL}
@@ -118,7 +149,7 @@ Subscribers: ${subscribers.size}
 
 Last signal:
 ${lastSignalKey || "None yet"}`,
-    { parse_mode: "Markdown" }
+    MAIN_KEYBOARD
   );
 });
 
@@ -127,16 +158,56 @@ bot.onText(/^\/test$/, async (msg) => {
 
   await bot.sendMessage(
     chatId,
-    `✅ *TEST MESSAGE*
+    `✅ TEST MESSAGE
 
 Telegram connection is working.
 
 🟡 XAUUSD Signal Engine
 ⏱ 5M
 🧠 BOS + FVG + OB`,
-    { parse_mode: "Markdown" }
+    MAIN_KEYBOARD
   );
 });
+
+// ---------- Signal Status button ----------
+
+function ago(ms) {
+  if (!ms) return "never";
+  const s = Math.round((Date.now() - ms) / 1000);
+  return s < 60 ? `${s}s ago` : `${Math.round(s / 60)} min ago`;
+}
+
+async function sendSignalStatus(chatId) {
+  const cooldownLeft = lastSignalTime
+    ? Math.max(
+        0,
+        Math.ceil((SIGNAL_COOLDOWN - (Date.now() - lastSignalTime)) / 60000)
+      )
+    : 0;
+
+  await bot.sendMessage(
+    chatId,
+    `📡 SIGNAL CHECK STATUS
+
+Engine: ${engineRunning ? "🟢 RUNNING" : "🔴 STOPPED"}
+Last check: ${ago(status.lastCheck)}
+Last candle: ${
+      status.lastCandle
+        ? new Date(status.lastCandle).toISOString()
+        : "none"
+    }
+Result: ${status.lastResult}
+Data error: ${status.lastError || "none"}
+
+Checks: ${status.checks} | Errors: ${status.errors}
+Last signal: ${lastSignalKey || "None yet"}
+Cooldown left: ${cooldownLeft} min`,
+    MAIN_KEYBOARD
+  );
+}
+
+bot.onText(/^\/signalstatus$/, (msg) => sendSignalStatus(msg.chat.id));
+bot.onText(/^📡 Signal Status$/, (msg) => sendSignalStatus(msg.chat.id));
 
 // ===============================
 // GET MARKET DATA
@@ -169,23 +240,39 @@ async function getCandles() {
       throw new Error("Not enough candle data");
     }
 
-    return response.data.values
+    const candles = response.data.values
       .map(c => ({
-        time: new Date(c.datetime).getTime(),
+        // datetime is UTC: force UTC parsing
+        time: new Date(c.datetime.replace(" ", "T") + "Z").getTime(),
         open: Number(c.open),
         high: Number(c.high),
         low: Number(c.low),
         close: Number(c.close)
       }))
       .filter(c =>
+        Number.isFinite(c.time) &&
         Number.isFinite(c.open) &&
         Number.isFinite(c.high) &&
         Number.isFinite(c.low) &&
         Number.isFinite(c.close)
       )
-      .sort((a, b) => a.time - b.time);
+      .sort((a, b) => a.time - b.time)
+      // keep CLOSED candles only (drop the one still forming)
+      .filter(c => c.time + CANDLE_MS <= Date.now());
+
+    if (candles.length < 30) {
+      throw new Error("Not enough closed candles");
+    }
+
+    status.lastError = null;
+    return candles;
 
   } catch (error) {
+    const msg =
+      error.response?.data?.message || error.message || "Unknown error";
+
+    status.lastError = msg;
+
     console.error(
       "❌ Market data error:",
       error.response?.data || error.message
@@ -205,10 +292,6 @@ function bullish(c) {
 
 function bearish(c) {
   return c.close < c.open;
-}
-
-function body(c) {
-  return Math.abs(c.close - c.open);
 }
 
 function range(c) {
@@ -281,15 +364,11 @@ function findBullishFVG(candles, confirmationIndex) {
 
     if (!left || !middle || !right) continue;
 
-    // Bullish FVG:
-    // current low > candle two candles earlier high
+    // Bullish FVG: current low > high of candle two candles earlier
     if (right.low > left.high) {
-      const zoneLow = left.high;
-      const zoneHigh = right.low;
-
       return {
-        low: zoneLow,
-        high: zoneHigh,
+        low: left.high,
+        high: right.low,
         index: i,
         type: "bullish"
       };
@@ -311,15 +390,11 @@ function findBearishFVG(candles, confirmationIndex) {
 
     if (!left || !middle || !right) continue;
 
-    // Bearish FVG:
-    // current high < candle two candles earlier low
+    // Bearish FVG: current high < low of candle two candles earlier
     if (right.high < left.low) {
-      const zoneLow = right.high;
-      const zoneHigh = left.low;
-
       return {
-        low: zoneLow,
-        high: zoneHigh,
+        low: right.high,
+        high: left.low,
         index: i,
         type: "bearish"
       };
@@ -391,13 +466,12 @@ function analyze(candles) {
     return null;
   }
 
-  // Last candle is treated as the latest closed candle
+  // Last candle is now truly the latest CLOSED candle
   const i = candles.length - 1;
 
   const current = candles[i];
   const previous = candles[i - 1];
 
-  // Avoid weak tiny candles
   if (range(current) <= 0) {
     return null;
   }
@@ -419,22 +493,15 @@ function analyze(candles) {
     if (fvg || ob) {
       const zone = fvg || ob;
 
-      // We need a pullback/interaction with the zone.
-      // Look at the previous 1-4 candles.
       let touched = false;
 
-      for (
-        let j = Math.max(0, i - 4);
-        j < i;
-        j++
-      ) {
+      for (let j = Math.max(0, i - 4); j < i; j++) {
         if (candleTouchesZone(candles[j], zone)) {
           touched = true;
           break;
         }
       }
 
-      // Current candle must also show bullish confirmation.
       if (
         touched &&
         bullish(current) &&
@@ -449,7 +516,6 @@ function analyze(candles) {
         );
 
         const sl = structureLow - 0.30;
-
         const risk = entry - sl;
 
         if (risk > 0) {
@@ -489,11 +555,7 @@ function analyze(candles) {
 
       let touched = false;
 
-      for (
-        let j = Math.max(0, i - 4);
-        j < i;
-        j++
-      ) {
+      for (let j = Math.max(0, i - 4); j < i; j++) {
         if (candleTouchesZone(candles[j], zone)) {
           touched = true;
           break;
@@ -514,7 +576,6 @@ function analyze(candles) {
         );
 
         const sl = structureHigh + 0.30;
-
         const risk = sl - entry;
 
         if (risk > 0) {
@@ -543,16 +604,10 @@ function analyze(candles) {
 // ===============================
 
 async function sendSignal(signal) {
-  const emoji = signal.direction === "BUY"
-    ? "🟢"
-    : "🔴";
-
-  const side = signal.direction === "BUY"
-    ? "BUY"
-    : "SELL";
+  const emoji = signal.direction === "BUY" ? "🟢" : "🔴";
 
   const message = `
-${emoji} *XAUUSD ${side} SIGNAL*
+${emoji} *XAUUSD ${signal.direction} SIGNAL*
 
 ━━━━━━━━━━━━━━━━━━
 
@@ -575,6 +630,7 @@ ${signal.reason}
 
   if (subscribers.size === 0) {
     console.log("⚠️ No Telegram subscribers.");
+    status.lastResult = "Signal found but no subscribers (send /start)";
     return;
   }
 
@@ -586,10 +642,7 @@ ${signal.reason}
 
       console.log(`📨 Signal sent to ${chatId}`);
     } catch (error) {
-      console.error(
-        `Telegram error for ${chatId}:`,
-        error.message
-      );
+      console.error(`Telegram error for ${chatId}:`, error.message);
     }
   }
 }
@@ -603,9 +656,14 @@ async function runEngine() {
 
   console.log("🔎 Checking XAUUSD...");
 
+  status.lastCheck = Date.now();
+  status.checks++;
+
   const candles = await getCandles();
 
   if (!candles) {
+    status.errors++;
+    status.lastResult = "❌ Market data unavailable";
     return;
   }
 
@@ -615,18 +673,21 @@ async function runEngine() {
 
   // Don't analyze same candle repeatedly
   if (latest.time === lastCheckedCandle) {
+    status.lastResult = "Waiting for next 5M candle to close";
     return;
   }
 
   lastCheckedCandle = latest.time;
+  status.lastCandle = latest.time;
 
   console.log(
-    `🕯 New 5M candle: ${new Date(latest.time).toISOString()}`
+    `🕯 New closed 5M candle: ${new Date(latest.time).toISOString()}`
   );
 
   const signal = analyze(candles);
 
   if (!signal) {
+    status.lastResult = "No valid setup";
     console.log("⏳ No valid setup.");
     return;
   }
@@ -636,23 +697,21 @@ async function runEngine() {
 
   const now = Date.now();
 
-  // Duplicate protection
   if (signalKey === lastSignalKey) {
+    status.lastResult = "Duplicate signal blocked";
     console.log("🚫 Duplicate signal blocked.");
     return;
   }
 
-  // Cooldown
-  if (
-    lastSignalTime &&
-    now - lastSignalTime < SIGNAL_COOLDOWN
-  ) {
+  if (lastSignalTime && now - lastSignalTime < SIGNAL_COOLDOWN) {
+    status.lastResult = "Setup found, cooldown active";
     console.log("⏳ Signal cooldown active.");
     return;
   }
 
   lastSignalKey = signalKey;
   lastSignalTime = now;
+  status.lastResult = `🚨 ${signal.direction} signal sent`;
 
   console.log(
     `🚨 SIGNAL: ${signal.direction} Entry=${signal.entry} SL=${signal.sl} TP=${signal.tp}`
@@ -674,8 +733,20 @@ console.log("🧠 BOS + FVG + ORDER BLOCK");
 console.log("🎯 RR: 1:2");
 console.log("=================================");
 
-// Run immediately
-runEngine();
+// Check once per 5M candle (288 API calls/day instead of 1440)
+function scheduleNext() {
+  const wait = CANDLE_MS - (Date.now() % CANDLE_MS) + 15000; // 15s after close
 
-// Then check every minute
-setInterval(runEngine, CHECK_EVERY);
+  setTimeout(async () => {
+    try {
+      await runEngine();
+    } catch (e) {
+      console.error("Engine error:", e.message);
+      status.lastResult = "Engine error: " + e.message;
+    }
+    scheduleNext();
+  }, wait);
+}
+
+runEngine();
+scheduleNext();
